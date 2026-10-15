@@ -1,0 +1,9 @@
+layers:
+  - name: handlers
+    paths: ["src/handlers/**"]
+  - name: services
+    paths: ["src/services/**"]
+  - name: db
+    paths: ["src/db/**"]
+rules:
+  - "forbid-import: handlers -> db.drivers"

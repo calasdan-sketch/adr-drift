@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "adr-drift"
+version = "0.1.0"
+description = "Deterministic architecture tests: keep the codebase honest about its own ADRs."
+readme = "README.md"
+requires-python = ">=3.10"
+[project.scripts]
+adr-drift = "adr_drift.cli:main"
