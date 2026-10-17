@@ -113,5 +113,27 @@ class TestEmptyBlockList(unittest.TestCase):
         with self.assertRaises(ValueError):
             miniyaml.safe_load("layers:\n  []\n  - x\n")
 
+
+class TestSingleQuoteEscape(unittest.TestCase):
+    """YAML: inside single quotes a doubled '' is one literal quote and
+    nothing else is an escape (so a backslash stays a backslash)."""
+
+    def test_doubled_quote_is_one_quote(self):
+        self.assertEqual(miniyaml.safe_load("a: 'it''s'\n"), {"a": "it's"})
+        self.assertEqual(miniyaml.safe_load("a: 'x''y''z'\n"), {"a": "x'y'z"})
+        self.assertEqual(miniyaml.safe_load("a: ''''\n"), {"a": "'"})
+
+    def test_empty_single_quoted_string_is_empty(self):
+        self.assertEqual(miniyaml.safe_load("a: ''\n"), {"a": ""})
+
+    def test_in_a_list_and_next_to_double_quotes(self):
+        self.assertEqual(miniyaml.safe_load("a:\n  - 'p''q'\n  - \"r''s\"\n"),
+                         {"a": ["p'q", "r''s"]})
+
+    def test_backslashes_stay_literal_in_single_quotes(self):
+        self.assertEqual(miniyaml.safe_load("a: 'C:\\dir\\n'\n"),
+                         {"a": "C:\\dir\\n"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,9 @@ def _scalar(s: str):
         inner = s[1:-1]
         if s[0] == '"':
             inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            # single quotes: '' is the only escape, one literal quote
+            inner = inner.replace("''", "'")
         return inner
     low = s.lower()
     if low in ("null", "~", "none", ""):
