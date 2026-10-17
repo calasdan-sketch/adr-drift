@@ -32,7 +32,7 @@ class TestConfig(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         os.makedirs(os.path.join(tmp, "docs", "adr"))
         p = os.path.join(tmp, "docs", "adr", "0001-x.md")
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             f.write("# X\n\n## Constraints\n\n- forbid-import: nope\n")
         with self.assertRaises(ValueError):
             c.parse_adr(p)
@@ -126,16 +126,16 @@ class TestSyntaxErrorWarning(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stderr
         tmp = tempfile.mkdtemp()
-        with open(os.path.join(tmp, "arch.yaml"), "w") as f:
+        with open(os.path.join(tmp, "arch.yaml"), "w", encoding="utf-8") as f:
             f.write('layers:\n'
                     '  - name: a\n    paths: ["a/**"]\n'
                     '  - name: b\n    paths: ["b/**"]\n'
                     'rules:\n'
                     '  - "forbid-import: a -> b"\n')
         os.makedirs(os.path.join(tmp, "a"))
-        with open(os.path.join(tmp, "a", "bad.py"), "w") as f:
+        with open(os.path.join(tmp, "a", "bad.py"), "w", encoding="utf-8") as f:
             f.write("def broken(:\n")
-        with open(os.path.join(tmp, "a", "ok.py"), "w") as f:
+        with open(os.path.join(tmp, "a", "ok.py"), "w", encoding="utf-8") as f:
             f.write("from b import thing\n")
         layers, rules = c.load_arch_yaml(tmp)
         buf = io.StringIO()
@@ -145,6 +145,70 @@ class TestSyntaxErrorWarning(unittest.TestCase):
         # the parseable violator is still caught; the broken file is not
         # silently treated as clean — it is skipped with a warning.
         self.assertEqual([v.file for v in vs], ["a/ok.py"])
+
+
+
+class TestRelativeAndFromImports(unittest.TestCase):
+    """Relative imports and from-import names must reach import rules."""
+
+    def _repo(self, files: dict) -> str:
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        for rel, body in files.items():
+            p = os.path.join(tmp, *rel.split("/"))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(body)
+        return tmp
+
+    def _check(self, root, rule):
+        layers = [{"name": "handlers", "paths": ["app/handlers/**"]},
+                  {"name": "db", "paths": ["app/db/**"]}]
+        return e.check(root, layers, [rules_mod.parse_rule_line(rule)])
+
+    def test_relative_import_resolves_to_module(self):
+        root = self._repo({
+            "app/__init__.py": "", "app/db/__init__.py": "",
+            "app/db/drivers/pg.py": "",
+            "app/handlers/__init__.py": "",
+            "app/handlers/orders.py": "from ..db.drivers import pg\n"})
+        v = self._check(root, "forbid-import: handlers -> db.drivers")
+        self.assertEqual([(x.file, x.line) for x in v],
+                         [("app/handlers/orders.py", 1)])
+
+    def test_from_import_name_matches_submodule_rule(self):
+        root = self._repo({
+            "app/db/drivers.py": "",
+            "app/handlers/orders.py": "from app.db import drivers\n"})
+        v = self._check(root, "forbid-import: handlers -> db.drivers")
+        self.assertEqual(len(v), 1)  # reported once, not once per name
+
+    def test_relative_import_in_package_init(self):
+        root = self._repo({
+            "app/handlers/__init__.py": "from .. import db\n",
+            "app/db/__init__.py": ""})
+        v = self._check(root, "forbid-import: handlers -> db")
+        self.assertEqual(len(v), 1)
+
+    def test_ts_relative_js_specifier_maps_to_ts_module(self):
+        # TS convention: "./x.js" refers to x.ts.
+        root = self._repo({
+            "app/db/config.ts": "export const x = 1;\n",
+            "app/handlers/a.ts":
+                'import { x } from "../db/config.js";\n'})
+        v = self._check(root, "forbid-import: handlers -> db.config")
+        self.assertEqual(len(v), 1)
+        self.assertEqual(v[0].detail, "imports app.db.config")
+
+
+class TestRepoRelativeRuleSource(unittest.TestCase):
+    def test_adr_rule_source_is_repo_relative(self):
+        _layers, all_rules, _adrs = c.load_all_rules(FIXTURE)
+        adr_sources = {r.source for r in all_rules
+                       if r.source != c.ARCH_FILE}
+        self.assertEqual(adr_sources, {
+            "docs/adr/0001-layered-architecture.md",
+            "docs/adr/0002-no-dynamic-eval.md"})
 
 
 if __name__ == "__main__":

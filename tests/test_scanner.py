@@ -80,5 +80,24 @@ class TestExtract(unittest.TestCase):
         self.assertIn("syntax error", err.lower())
 
 
+
+class TestRelativeResolution(unittest.TestCase):
+    def test_relative_resolves_against_file_package(self):
+        src = "from ..db.drivers import pg\nfrom . import sib\n"
+        mods = [m for m, _ in s.python_imports(src, "src/handlers/a.py")]
+        self.assertIn("src.db.drivers", mods)
+        self.assertIn("src.db.drivers.pg", mods)
+        self.assertIn("src.handlers.sib", mods)
+
+    def test_relative_above_root_is_local(self):
+        mods = [m for m, _ in s.python_imports("from ... import x\n", "a.py")]
+        self.assertEqual(mods, ["<local>"])
+
+    def test_windows_separators(self):
+        mods = [m for m, _ in s.python_imports(
+            "from .x import y\n", "pkg\\sub\\a.py")]
+        self.assertIn("pkg.sub.x.y", mods)
+
+
 if __name__ == "__main__":
     unittest.main()

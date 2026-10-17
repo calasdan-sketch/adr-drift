@@ -119,9 +119,14 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                     from_hit = rules_mod.match_pat(rule.from_pat, mod_prefix)
                 if not from_hit:
                     continue
+                hit_lines: set[int] = set()
                 for mod, lineno in imports:
+                    # "from m import n" yields m and m.n: report a line once.
+                    if lineno in hit_lines:
+                        continue
                     if any(rules_mod.match_pat(rule.to_pat, ident)
                            for ident in _import_identities(mod, layers)):
+                        hit_lines.add(lineno)
                         violations.append(Violation(
                             rule=rule, file=rel, line=lineno,
                             detail=f"imports {mod}"))

@@ -28,6 +28,40 @@ VERSION = "0.1.0"
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
              "dist", "build", ".tox", "vendor", "docs"}
 
+# Report glyphs and their ASCII stand-ins. A Windows console or pipe often
+# runs cp1252, which cannot encode the check marks: printing them there
+# raised UnicodeEncodeError and killed the run.
+_ASCII_SYMBOLS = {"✓": "[ok]", "✗": "[x]", "—": "--"}
+
+
+def sym(s: str) -> str:
+    """`s` if the current stdout can encode it, else an ASCII stand-in."""
+    enc = getattr(sys.stdout, "encoding", None)
+    if not enc:
+        return s  # e.g. io.StringIO: takes any str
+    try:
+        s.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        return _ASCII_SYMBOLS.get(
+            s, s.encode("ascii", "replace").decode("ascii"))
+    return s
+
+
+def _harden_streams() -> None:
+    """Never crash on a console that cannot encode a path or ADR title.
+
+    Python's stderr already replaces unencodable characters; make stdout
+    do the same instead of raising UnicodeEncodeError mid-report.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
 
 def _infer_layers(root: str) -> list[dict]:
     base = os.path.join(root, "src") if os.path.isdir(
@@ -46,7 +80,6 @@ ARCH_TEMPLATE = """# ADR Drift architecture config.
 #   forbid-import: <from> -> <to>      layer/module <from> may not import <to>
 #   forbid-pattern: <glob> !~ <regex>  files matching <glob> must not contain <regex>
 #   require-pattern: <glob> =~ <regex> files matching <glob> must contain <regex>
-layers:
 {layers}
 rules:
   # Tighten me: uncomment and adapt.
@@ -69,11 +102,12 @@ What we decided.
 
 ## Constraints
 
-Machine-checkable rules ADR Drift enforces in CI. Examples:
+Machine-checkable rules ADR Drift enforces in CI. Examples only — they
+are commented out; delete the leading "#" to enforce one:
 
-- forbid-import: handlers -> db.drivers
-- forbid-pattern: src/**.py !~ \\beval\\(
-- require-pattern: src/handlers/**.py =~ authenticate\\(
+    # - forbid-import: handlers -> db.drivers
+    # - forbid-pattern: src/**.py !~ \\beval\\(
+    # - require-pattern: src/handlers/**.py =~ authenticate\\(
 
 ## Consequences
 
@@ -91,13 +125,15 @@ def cmd_init(args) -> int:
     layer_yaml = "".join(
         f"  - name: {l['name']}\n    paths: {[p for p in l['paths']]}".replace(
             "'", '"') + "\n" for l in layers)
-    with open(arch_path, "w") as f:
-        f.write(ARCH_TEMPLATE.format(layers=layer_yaml or "  []\n"))
+    with open(arch_path, "w", encoding="utf-8") as f:
+        f.write(ARCH_TEMPLATE.format(
+            layers=("layers:\n" + layer_yaml.rstrip("\n")) if layer_yaml
+            else "layers: []"))
     adr_dir = os.path.join(root, args.adr_dir)
     os.makedirs(adr_dir, exist_ok=True)
     sample = os.path.join(adr_dir, "0001-record-architecture-decisions.md")
     if not os.path.exists(sample):
-        with open(sample, "w") as f:
+        with open(sample, "w", encoding="utf-8") as f:
             f.write(ADR_TEMPLATE.format(num=1,
                                         title="Record architecture decisions"))
     cmd_index(args)
@@ -117,9 +153,9 @@ def _print_violations(violations, fmt: str) -> None:
         print(json.dumps([v.as_dict() for v in violations], indent=2))
         return
     if not violations:
-        print("✓ no architecture drift — all ADRs hold")
+        print(f"{sym('✓')} no architecture drift {sym('—')} all ADRs hold")
         return
-    print(f"✗ {len(violations)} architecture violation(s):\n")
+    print(f"{sym('✗')} {len(violations)} architecture violation(s):\n")
     by_file: dict[str, list] = {}
     for v in violations:
         by_file.setdefault(v.file, []).append(v)
@@ -139,9 +175,12 @@ def cmd_check(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if not all_rules:
-        print("no rules found — run `adr-drift init` or add a ## Constraints "
-              "section to an ADR.")
-        return 0 if args.fail_on == "none" else 2
+        print(f"no rules found {sym('—')} run `adr-drift init` or add a "
+              "## Constraints section to an ADR.")
+        # Fresh `init` (arch.yaml present, rules still commented) is a
+        # configured repo with nothing to enforce yet; no config at all is not.
+        configured = os.path.isfile(os.path.join(root, config_mod.ARCH_FILE))
+        return 0 if args.fail_on == "none" or configured else 2
     violations = engine_mod.check(root, layers, all_rules,
                                   strict_py_only=args.strict_py_only)
     if args.baseline:
@@ -206,14 +245,15 @@ def cmd_drift(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if not all_rules:
-        print("no rules found — nothing to drift from.")
+        print(f"no rules found {sym('—')} nothing to drift from.")
         return 0
 
     changed = [p for p in githelp.changed_files(root, args.since)
                if os.path.splitext(p)[1].lower()
                in (scanner_mod.PY_EXTS | scanner_mod.GENERIC_EXTS)]
     if not changed:
-        print(f"no source files changed since {args.since} — no drift")
+        print(f"no source files changed since {args.since} "
+              f"{sym('—')} no drift")
         return 0
 
     def entries_for(get_content) -> list:
@@ -253,22 +293,22 @@ def cmd_drift(args) -> int:
         print(json.dumps([v.as_dict() for v in new_violations], indent=2))
     else:
         if not new_violations:
-            print(f"✓ no new drift since {args.since} "
+            print(f"{sym('✓')} no new drift since {args.since} "
                   f"({len(changed)} file(s) changed)")
         else:
-            print(f"✗ {len(new_violations)} NEW violation(s) "
+            print(f"{sym('✗')} {len(new_violations)} NEW violation(s) "
                   f"since {args.since}:\n")
             for v in new_violations:
                 commit = githelp.blame_commit_for_line(
                     root, v.file, v.line or 1)
                 tag = f" [{commit}]" if commit else ""
-                print(f"  {v.file}:{v.line or '—'}{tag}: {v.detail}")
+                print(f"  {v.file}:{v.line or sym('—')}{tag}: {v.detail}")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
         if fixed_violations:
-            print(f"\n✓ {len(fixed_violations)} fixed since "
+            print(f"\n{sym('✓')} {len(fixed_violations)} fixed since "
                   f"{args.since}:\n")
             for v in fixed_violations:
-                print(f"  {v.file}:{v.line or '—'}: {v.detail} (fixed)")
+                print(f"  {v.file}:{v.line or sym('—')}: {v.detail} (fixed)")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
     if new_violations and args.fail_on != "none":
         return 1
@@ -286,7 +326,7 @@ def cmd_new(args) -> int:
     n = max(nums, default=0) + 1
     slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")
     path = os.path.join(adr_dir, f"{n:04d}-{slug}.md")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(ADR_TEMPLATE.format(num=n, title=args.title))
     print(f"created {os.path.relpath(path, args.root)}")
     return 0
@@ -304,7 +344,7 @@ def cmd_index(args) -> int:
         lines.append(f"| {a['number']} | [{a['title']}]({rel}) "
                      f"| {a['status'] or '—'} |")
     lines.append("")
-    with open(os.path.join(adr_dir, "README.md"), "w") as f:
+    with open(os.path.join(adr_dir, "README.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"indexed {len(adrs)} ADR(s) -> "
           f"{os.path.join(args.adr_dir, 'README.md')}")
@@ -358,6 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    _harden_streams()
     args = build_parser().parse_args(argv)
     return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
             "drift": cmd_drift, "new": cmd_new,

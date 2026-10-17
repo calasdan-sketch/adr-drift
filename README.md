@@ -16,8 +16,7 @@ PHP-only. ADR Drift is language-agnostic, repo-local, and CI-friendly.
 ## Install
 
 ```bash
-git clone <repo> && cd adr-drift
-pip install .   # provides the `adr-drift` console script
+pip install git+https://github.com/calasdan-sketch/adr-drift   # provides `adr-drift`
 ```
 
 Or run without installing: `python3 -m adr_drift` from the repo root.
@@ -57,6 +56,11 @@ require-pattern: src/handlers/**.py =~ authenticate\(   # handlers must authenti
 
 `from`/`to` match layer names or module prefixes (`db.drivers` matches
 `db.drivers.pg`); `*` wildcards supported. Comments start with `#`.
+Python relative imports resolve against the file's package
+(`from ..db.drivers import pg` in `src/handlers/` is `src.db.drivers.pg`),
+and `from app.db import drivers` counts as importing `app.db.drivers`.
+JS/TS relative specifiers resolve against the importing file with the
+extension dropped (`"../db/config.js"` matches a `config.ts` module).
 To-side patterns resolve against layer paths too: in a `src/`-layout repo
 both `db.drivers` and `src.db.drivers` spellings match a `db` layer mapped
 to `src/db/**`.
@@ -77,16 +81,32 @@ to `src/db/**`.
 - run: python3 -m adr_drift check --format json --fail-on violations
 ```
 
-`--fail-on none` reports without failing. JSON output is stable for tooling.
+Or use the bundled composite action (needs Python on the runner):
+
+```yaml
+- uses: actions/checkout@v4
+- uses: calasdan-sketch/adr-drift@main
+  with:
+    args: --baseline .adr-baseline.json   # optional
+```
+
+`--fail-on none` reports without failing. With no rules yet, `check` exits 0
+once `arch.yaml` exists (fresh `init`) and 2 when nothing is configured. JSON output is stable for tooling.
 
 ## Honest limits
 
 - The regex fallback for non-Python languages is heuristic — it can miss
   exotic import forms. Python is precise; everything else is best-effort.
 - `drift` needs a git repo; `check` works anywhere.
+- Windows: files are always read and written as UTF-8, and on a console
+  that can't show ✓/✗ (cp1252 pipes) the report falls back to `[ok]`/`[x]`.
 - Rules are only as good as the constraints you write — `init` scaffolds,
   you tighten.
 
 ## Tests
 
-55/55 pass: `python3 -m unittest discover -s tests`
+93/93 pass: `python3 -m unittest discover -s tests` (or `python -m pytest -q`)
+
+## License
+
+MIT — see [LICENSE](LICENSE).

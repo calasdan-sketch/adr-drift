@@ -102,5 +102,16 @@ class TestStrictMalformed(unittest.TestCase):
         self.assertEqual(miniyaml.safe_load("g: 'a: b'"), {"g": "a: b"})
 
 
+
+
+class TestEmptyBlockList(unittest.TestCase):
+    def test_flow_list_on_own_line(self):
+        self.assertEqual(miniyaml.safe_load("layers:\n  []\nrules: [a]\n"),
+                         {"layers": [], "rules": ["a"]})
+
+    def test_extra_line_after_flow_block_rejected(self):
+        with self.assertRaises(ValueError):
+            miniyaml.safe_load("layers:\n  []\n  - x\n")
+
 if __name__ == "__main__":
     unittest.main()

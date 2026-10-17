@@ -7,8 +7,11 @@ import subprocess
 
 
 def _git(root: str, *args: str) -> str:
+    # Git talks UTF-8; decoding with the locale (cp1252 on Windows) would
+    # garble or reject non-ASCII paths and file contents.
     p = subprocess.run(["git", "-C", root, *args],
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=30)
     if p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
     return p.stdout
@@ -31,7 +34,8 @@ def changed_files(root: str, since: str) -> list[str]:
 def file_at_ref(root: str, ref: str, rel_path: str) -> str | None:
     """File content at a git ref, or None if the file didn't exist."""
     p = subprocess.run(["git", "-C", root, "show", f"{ref}:{rel_path}"],
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=30)
     if p.returncode != 0:
         return None
     return p.stdout

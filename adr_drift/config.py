@@ -83,5 +83,8 @@ def load_all_rules(root: str, adr_dir: str = DEFAULT_ADR_DIR
     adrs = [parse_adr(p) for p in adr_files(root, adr_dir)]
     all_rules = list(arch_rules)
     for a in adrs:
+        for r in a["rules"]:
+            # Report ADR sources repo-relative, not as absolute paths.
+            r.source = os.path.relpath(r.source, root).replace(os.sep, "/")
         all_rules.extend(a["rules"])
     return layers, all_rules, adrs
