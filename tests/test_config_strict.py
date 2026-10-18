@@ -104,6 +104,30 @@ class TestUnknownKeys(unittest.TestCase):
         _layers, rules = c.load_arch_yaml(root)
         self.assertEqual(len(rules), 1)
 
+    def test_x_prefixed_note_keys_are_allowed_in_a_layer_too(self):
+        root = make_repo({"arch.yaml": (
+            "layers:\n"
+            '  - name: a\n    paths: ["a/**"]\n    x-owner: platform team\n'
+            '  - x-note: "the data layer"\n    name: b\n    paths: ["b/**"]\n'
+            "    x-tags: [db, sql]\n"
+            'rules:\n  - "forbid-import: a -> b"\n'), **VIOLATOR})
+        layers, rules = c.load_arch_yaml(root)
+        self.assertEqual(layers, [{"name": "a", "paths": ["a/**"]},
+                                  {"name": "b", "paths": ["b/**"]}])
+        self.assertEqual(len(rules), 1)
+        code, out, err = run_main("--root", root, "check")
+        self.assertEqual(code, 1, out + err)      # the rule still fires
+        self.assertNotIn("unknown key", err)
+
+    def test_another_unknown_layer_key_still_fails_and_names_the_prefix(self):
+        root = make_repo({"arch.yaml": (
+            'layers:\n  - name: a\n    paths: ["a/**"]\n    owner: me\n')})
+        code, out, err = run_main("--root", root, "check")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("arch.yaml:4", err)
+        self.assertIn("unknown key 'owner'", err)
+        self.assertIn("'x-'", err)
+
     def test_layer_paths_may_be_a_single_glob_string(self):
         root = make_repo({"arch.yaml": 'layers:\n  - name: a\n'
                           '    paths: "a/**"\n'})
@@ -290,6 +314,17 @@ class TestNothingEnforced(unittest.TestCase):
 
 
 class TestRulesThatMatchNothing(unittest.TestCase):
+    def test_a_repo_without_any_adr_warns(self):
+        # all rules in arch.yaml and no ADR: the check ran, but "all ADRs
+        # hold" would claim more than was read
+        root = make_repo({"arch.yaml": ARCH_HEAD + "rules:\n"
+                          '  - "forbid-import: a -> b"\n',
+                          "a/x.py": "x = 1\n", "b/y.py": "y = 1\n"})
+        code, out, err = run_main("--root", root, "check")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("no ADR files found", err)
+        self.assertEqual(run_main("--root", root, "check", "--strict")[0], 2)
+
     def test_glob_matching_no_file_warns(self):
         root = make_repo({"arch.yaml": ARCH_HEAD + "rules:\n"
                           '  - "forbid-pattern: srcc/**.py !~ eval"\n',
@@ -344,6 +379,7 @@ class TestRulesThatMatchNothing(unittest.TestCase):
     def test_clean_repo_with_matching_rules_has_no_warnings(self):
         root = make_repo({"arch.yaml": ARCH_HEAD + "rules:\n"
                           '  - "forbid-import: a -> b"\n',
+                          "docs/adr/0001-layers.md": adr(),
                           "a/x.py": "x = 1\n", "b/y.py": "y = 1\n"})
         code, out, err = run_main("--root", root, "check", "--strict")
         self.assertEqual(code, 0, out + err)

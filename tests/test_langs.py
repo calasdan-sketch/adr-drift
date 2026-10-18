@@ -245,8 +245,12 @@ class TestWiring(unittest.TestCase):
         self.assertIn("a.go: unparsable Go", d.warnings[0])
 
     def test_absurdly_nested_use_tree_does_not_recurse_forever(self):
-        self.assertEqual(mods("a.rs", "use a::{" * 5000), [])
-        mods("a.rs", "use a::{" * 5000 + "b" + "};" * 5000)  # returns at all
+        # It is refused (extract_imports reports the file as unparsable),
+        # not skipped in silence and not a RecursionError.
+        for text in ("use a::{" * 5000,
+                     "use a::{" * 5000 + "b" + "};" * 5000):
+            with self.assertRaises(langs.ExtractionLimit):
+                mods("a.rs", text)
         self.assertEqual(
             mods("a.rs", "use a::{b::{c::{d::{e, f}}}};"),
             [("a.b.c.d.e", 1), ("a.b.c.d.f", 1)])

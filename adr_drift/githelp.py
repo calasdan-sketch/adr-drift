@@ -142,9 +142,18 @@ def _blob(mode: bytes, sha: bytes) -> str:
 
 
 def changes(root: str, base: str, head: str = "HEAD") -> "list[Change]":
-    """Files that differ between commits `base` and `head`, renames paired."""
+    """Files that differ between commits `base` and `head`, renames paired.
+
+    Paths are relative to `root`, and only files under `root` are listed.
+    When `root` is a package inside a larger repository (a monorepo) git
+    would otherwise name every file from the top-level, which no layer glob
+    or rule matches, and report changes next door as if they were ours: a
+    violation went unseen and `drift` printed a green. `--relative` makes
+    git itself translate the paths and drop the others; a file moved across
+    the boundary is then an added or a deleted file, as `root` sees it.
+    """
     out = _run(root, "diff", "--raw", "-z", "-M", "--no-abbrev",
-               "--no-ext-diff", "--no-textconv", base, head)
+               "--no-ext-diff", "--no-textconv", "--relative", base, head)
     fields = out.split(b"\0")
     result: "list[Change]" = []
     i = 0

@@ -46,8 +46,10 @@ class Rule:
         return f"{self.source}:{self.line_no}" if self.line_no else self.source
 
 
+# The text is stripped before it is matched, so no \s*$ is needed after the
+# rest (a lazy group followed by \s*$ is quadratic on a long run of blanks).
 _RULE_RE = re.compile(
-    r"^(forbid-import|forbid-pattern|require-pattern)\s*:\s*(.+?)\s*$")
+    r"^(forbid-import|forbid-pattern|require-pattern)\s*:\s*(.+)$")
 
 
 def parse_rule_line(line: str, source: str = "",

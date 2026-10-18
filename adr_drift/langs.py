@@ -10,7 +10,10 @@ parser - but careful in the ways that matter for architecture rules:
 * a module is returned the way rules spell it: dotted for Rust and PHP
   (`crate::db::x` -> `db.x`, `App\\Models\\User` -> `App.Models.User`),
   relative paths resolved against the importing file;
-* every scan is linear in the size of the file, whatever it contains.
+* every scan takes time linear in the size of the file, whatever it
+  contains: a string that cannot close, a run of `)use`, a `use` list that
+  never ends. (A file that would need more work than a file of its size
+  should is refused as ExtractionLimit, reported as unparsable.)
 
 README, "Languages: exact support", lists what each language covers.
 """
@@ -40,11 +43,31 @@ def language_of(path: str) -> "str | None":
     return LANG_BY_EXT.get(posixpath.splitext(path)[1].lower())
 
 
+class ExtractionLimit(Exception):
+    """A file asks for more work than a fair file of its size. The caller
+    (scanner.extract_imports) reports it as unparsable, like a file that
+    nests too deeply, instead of stalling the run."""
+
+
 # -- tokenizer ---------------------------------------------------------------
 
-_DQ = r'"(?:\\.|[^"\\\n])*"'
-_SQ = r"'(?:\\.|[^'\\\n])*'"
-_BT = r"`(?:\\.|[^`\\])*`"      # JS template literal / Go raw string
+# A string literal is read in two steps, so that no input makes the scan
+# quadratic. The regex takes the plain case in one match: the opening quote,
+# text with no backslash (and, for " and ', no line break), the closing
+# quote. Such a scan stops at the first quote, backslash or line break after
+# its opener, so two of them never overlap. Every other opening quote - the
+# string has an escape in it, or it does not close - comes out of the regex
+# alone (group q) and _string_end() reads on from there.
+_PLAIN = {'"': r'"[^"\\\n]*"', "'": r"'[^'\\\n]*'", "`": r"`[^`\\]*`"}
+
+# What can end a string or change how it is read: its quote, a backslash (it
+# escapes the next character, whatever that is) and, for " and ', a line
+# break. A backtick string (JS template literal, Go raw string) may span lines.
+_STRING_STOPS = {
+    '"': re.compile(r'["\\\n]'),
+    "'": re.compile(r"['\\\n]"),
+    "`": re.compile(r"[`\\]"),
+}
 
 # An unterminated block comment runs to the end of the file (that is what a
 # compiler does with it), and consuming it in one match keeps the scan
@@ -52,24 +75,57 @@ _BT = r"`(?:\\.|[^`\\])*`"      # JS template literal / Go raw string
 _C_COMMENT = r"/\*.*?(?:\*/|\Z)|//[^\n]*"
 
 
-def _tokenizer(comment: str, strings: str) -> "re.Pattern":
-    # n: newline, c: comment, s: string literal, w: word, p: one punctuation
-    # mark. Other whitespace matches nothing and is skipped. A quote with no closing
-    # quote on its line (a regex literal, an apostrophe) matches no string
-    # and falls through to p, so it cannot swallow the code after it.
+def _tokenizer(comment: str, quotes: str) -> "re.Pattern":
+    # n: newline, c: comment, s: string literal without escapes, q: any other
+    # opening quote, w: word, p: one punctuation mark. Other whitespace
+    # matches nothing and is skipped.
+    plain = "|".join(_PLAIN[q] for q in quotes)
     return re.compile(
-        rf"(?P<n>\n)|(?P<c>{comment})|(?P<s>{strings})|(?P<w>[\w$]+)"
-        rf"|(?P<p>::|[^\s\w$])", re.S)
+        rf"(?P<n>\n)|(?P<c>{comment})|(?P<s>{plain})|(?P<q>[{quotes}])"
+        rf"|(?P<w>[\w$]+)|(?P<p>::|[^\s\w$])", re.S)
 
 
 _TOKENIZERS = {
-    "js": _tokenizer(_C_COMMENT, f"{_DQ}|{_SQ}|{_BT}"),
-    "go": _tokenizer(_C_COMMENT, f"{_DQ}|{_SQ}|{_BT}"),
-    "java": _tokenizer(_C_COMMENT, f"{_DQ}|{_SQ}"),
-    "rust": _tokenizer(_C_COMMENT, _DQ),
-    "php": _tokenizer(_C_COMMENT + r"|\#(?!\[)[^\n]*", f"{_DQ}|{_SQ}"),
-    "ruby": _tokenizer(r"\#[^\n]*", f"{_DQ}|{_SQ}"),
+    "js": _tokenizer(_C_COMMENT, "\"'`"),
+    "go": _tokenizer(_C_COMMENT, "\"'`"),
+    "java": _tokenizer(_C_COMMENT, "\"'"),
+    "rust": _tokenizer(_C_COMMENT, '"'),
+    "php": _tokenizer(_C_COMMENT + r"|\#(?!\[)[^\n]*", "\"'"),
+    "ruby": _tokenizer(r"\#[^\n]*", "\"'"),
 }
+
+
+def _string_end(text: str, start: int) -> "tuple[int, int]":
+    """Read the string literal whose opening quote is text[start].
+
+    Returns (end, 0) with `end` just past the closing quote, or (-1, stop)
+    when the string does not close; `stop` is where reading failed (a line
+    break, the end of the text). The quote is then plain punctuation, so a
+    regex literal or an apostrophe cannot swallow the code after it.
+
+    Every quote of the same kind between `start` and `stop` fails as well:
+    the reading went over it as the second character of an escape (a quote
+    that closes would have ended the string there), and from that point the
+    two readings are one and the same. The caller keeps `stop`, so a line
+    made of escaped quotes is read once, not once per quote.
+    """
+    quote = text[start]
+    find = _STRING_STOPS[quote].search
+    size = len(text)
+    i = start + 1
+    while True:
+        m = find(text, i)
+        if m is None:
+            return -1, size
+        k = m.start()
+        c = text[k]
+        if c == quote:
+            return k + 1, 0
+        if c != "\\":                    # a line break
+            return -1, k
+        if k + 1 >= size:                # a backslash at the very end
+            return -1, size
+        i = k + 2
 
 
 def _blank_ruby_blocks(text: str) -> str:
@@ -101,26 +157,51 @@ class _Tokens:
         self.line: "list[int]" = []
         self.first: "list[bool]" = []
         line, fresh = 1, True            # fresh: no token yet on this line
-        for m in _TOKENIZERS[lang].finditer(text):
-            kind = m.lastgroup
-            if kind == "n":
-                line += 1
-                fresh = True
-                continue
-            tok = m.group()
-            if kind == "c":              # code after a comment is still the
-                if "\n" in tok:          # first code on its line
-                    line += tok.count("\n")
+        pattern = _TOKENIZERS[lang]
+        add_kind, add_text = self.kind.append, self.text.append
+        add_line, add_first = self.line.append, self.first.append
+        dead: "dict[str, int]" = {}      # quote -> no string of it opens before
+        pos = 0
+        while pos >= 0:
+            resume = -1                  # where to go on after a long string
+            for m in pattern.finditer(text, pos):
+                kind = m.lastgroup
+                if kind == "n":
+                    line += 1
                     fresh = True
-                continue
-            self.kind.append(kind)
-            self.text.append(tok)
-            self.line.append(line)
-            self.first.append(fresh)
-            fresh = False
-            if kind == "s" and "\n" in tok:
-                line += tok.count("\n")
+                    continue
+                tok = m.group()
+                if kind == "c":              # code after a comment is still the
+                    if "\n" in tok:          # first code on its line
+                        line += tok.count("\n")
+                        fresh = True
+                    continue
+                if kind == "q":
+                    start = m.start()
+                    end = -1
+                    if start >= dead.get(tok, 0):
+                        end, stop = _string_end(text, start)
+                        if end < 0:
+                            dead[tok] = stop
+                    if end < 0:
+                        kind = "p"           # a quote that opens nothing
+                    else:
+                        kind, tok, resume = "s", text[start:end], end
+                add_kind(kind)
+                add_text(tok)
+                add_line(line)
+                add_first(fresh)
+                fresh = False
+                if kind == "s" and "\n" in tok:
+                    line += tok.count("\n")
+                if resume >= 0:
+                    break
+            pos = resume
         self.n = len(self.kind)
+        # Work done on `use` trees so far, and what a file of this size may
+        # spend on them (see _spend).
+        self.work = 0
+        self.budget = _WORK_PER_TOKEN * self.n + _WORK_BASE
 
     def word(self, i: int) -> str:
         """The word at i, else ""."""
@@ -273,6 +354,23 @@ def _java(path: str, t: _Tokens) -> "list[tuple[str, int]]":
 
 _MAX_USE_DEPTH = 16   # real code nests braces two or three deep
 
+#: What a file may spend on reading `use` trees: a number of steps per token
+#: plus a base. A fair file spends about one step per token (each `use` is
+#: read once); the margin is wide.
+_WORK_PER_TOKEN = 8
+_WORK_BASE = 10_000
+
+
+def _spend(t: _Tokens, steps: int) -> None:
+    """Count work done on `use` trees; give up when a file has spent far more
+    than a fair file of its size. A `use` list that never ends (`use a,` on
+    every line) is one statement that reaches to the end of the file, read
+    again from every one of its `use`: that is quadratic, and a run must not
+    stall on one hostile file."""
+    t.work += steps
+    if t.work > t.budget:
+        raise ExtractionLimit("too much work to read its use declarations")
+
 
 def _use_tree(t: _Tokens, j: int, prefix: "list[str]", sep: str,
               depth: int = 0) -> "tuple[list[list[str]], int]":
@@ -282,8 +380,13 @@ def _use_tree(t: _Tokens, j: int, prefix: "list[str]", sep: str,
     segs = list(prefix)
     out: "list[list[str]]" = []
     if depth > _MAX_USE_DEPTH:
-        return out, t.n                  # absurdly nested: give up on the rest
+        # Not skipped in silence: a file that nests this deep is refused, so
+        # that it is reported, and so that each of its `use` does not cost
+        # a descent of sixteen levels.
+        raise ExtractionLimit("use declarations nested too deeply to read")
+    _spend(t, 1 + len(prefix) // 16)     # copying a long prefix is not free
     while j < t.n:
+        _spend(t, 1)
         kind, text = t.kind[j], t.text[j]
         if kind == "w":
             if text == "as":
@@ -312,6 +415,7 @@ def _use_tree(t: _Tokens, j: int, prefix: "list[str]", sep: str,
     if len(segs) > len(prefix):
         if segs[-1] == "self" and prefix:
             segs.pop()
+        _spend(t, len(segs) // 16)
         out.append(segs)
     return out, j
 
@@ -352,11 +456,12 @@ def _rust_path(segs: "list[str]", module: "list[str]") -> str:
         segs = segs[1:]
     elif segs and segs[0] in ("self", "super"):
         base = list(module)
-        while segs and segs[0] in ("self", "super"):
-            if segs[0] == "super" and base:
+        k = 0
+        while k < len(segs) and segs[k] in ("self", "super"):
+            if segs[k] == "super" and base:
                 base.pop()
-            segs = segs[1:]
-        segs = base + segs
+            k += 1
+        segs = base + segs[k:]
     return ".".join(segs)
 
 
@@ -365,12 +470,15 @@ def _rust_item_start(t: _Tokens, i: int) -> bool:
     `pub` or `pub(crate)`?"""
     j = i - 1
     if t.punct(j) == ")":                       # pub(crate) / pub(in a::b)
-        while j >= 0 and t.punct(j) != "(":
-            j -= 1
-        j -= 1
-        if t.word(j) != "pub":
+        # No parenthesis stands inside a visibility, so the walk back ends
+        # at the first one: each `)` is walked over once, whatever the
+        # file holds (`)use x;` on every line, say).
+        k = j - 1
+        while k >= 0 and t.punct(k) not in ("(", ")"):
+            k -= 1
+        if t.punct(k) != "(" or t.word(k - 1) != "pub":
             return False
-        j -= 1
+        j = k - 2
     elif t.word(j) == "pub":
         j -= 1
     return j < 0 or t.starts_statement(j + 1, after=(";", "{", "}", "]"))

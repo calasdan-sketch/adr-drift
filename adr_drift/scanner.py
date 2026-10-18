@@ -69,6 +69,8 @@ def describe_parse_error(e: BaseException) -> str:
         return "nested too deeply to parse"
     if isinstance(e, MemoryError):
         return "out of memory while parsing"
+    if isinstance(e, langs.ExtractionLimit):
+        return str(e)
     return f"{type(e).__name__}: {e}"
 
 
@@ -166,7 +168,7 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
     if ext in GENERIC_EXTS and not strict_py_only:
         try:
             imports = generic_imports(decode_source(path, source), path)
-        except (RecursionError, MemoryError) as e:
+        except (RecursionError, MemoryError, langs.ExtractionLimit) as e:
             unparsable(langs.LANG_NAMES[langs.language_of(path)], e)
             return [], "regex"
         if ext == ".go":

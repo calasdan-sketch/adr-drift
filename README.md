@@ -37,12 +37,17 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 
 | Command | What it does |
 |---|---|
-| `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index |
+| `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index (a `README.md` of yours is kept) |
 | `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules) |
 | `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` |
 | `drift --since HEAD~5` | Report violations *introduced* between a git ref and `HEAD`, plus violations *fixed* in that range (pre-existing ones ignored) |
 | `new "title"` | Create the next-numbered ADR from a template |
-| `index` | Regenerate the one-sentence-per-ADR index (`docs/adr/README.md`) |
+| `index` | Regenerate the ADR index (`docs/adr/README.md`); a `README.md` adr-drift did not write is left alone unless you pass `--force` |
+
+Every command takes `--root DIR` (the repository; default: the working
+directory) and `--adr-dir DIR` (where the ADRs are, see below), before or
+after the command name: `adr-drift --root app check` and
+`adr-drift check --root app` are the same.
 
 ## The constraint DSL
 
@@ -68,6 +73,51 @@ and, in a flat layout, `import db.conn` - a rule naming the layer (`db`) or
 any of those spellings matches all of them. Only the layer's leading
 directories are stripped, never its own, so `conn` alone matches nothing.
 
+### Where the ADRs are
+
+Every `*.md` file in the ADR directory and in its subdirectories is read
+(`docs/adr/2024/0007-use-kafka.md` counts), except `README.md` files and
+anything under a hidden directory or `node_modules`. Without `--adr-dir` the
+directory is the first of `docs/adr`, `doc/adr` (adr-tools),
+`docs/decisions` (MADR), `docs/architecture/decisions`, `adr` and
+`decisions` that exists. With `--adr-dir DIR` exactly that directory is read;
+repeat the option to read several:
+`--adr-dir docs/adr --adr-dir services/api/adr`. `new`, `index` and `init`
+write into the first `--adr-dir`, else into the directory found, else
+`docs/adr`.
+
+Reading no ADRs must never pass for "all ADRs hold". These are warnings
+(`--strict` makes them exit 2): no ADR file found at all, an `--adr-dir` that
+does not exist, a directory that cannot be read, and another candidate
+directory whose ADRs were *not* read because an earlier one was used (pass
+every directory you want with `--adr-dir`). The all-clear line says how many
+ADRs were read - `all ADRs hold (4 read)`, or `0 ADRs read (only the rules in
+arch.yaml were checked)` - and `drift` ends its line with the same count. With
+`--format json` stdout stays the bare array of violations; the warnings are
+on stderr.
+
+### The index, the sample ADR and the statuses
+
+`index` writes a table of the ADRs (number, title, status) to `README.md`
+in the ADR directory, under a first line that says adr-drift generated it.
+A `README.md` without that line - one you wrote - is never overwritten:
+`index` says so and exits 2, and `index --force` replaces it. (The index
+written by 0.1.1 and earlier has no such line; it is still recognised as
+long as it is only the table.) `index` needs the ADR directory to exist
+(exit 2 otherwise).
+
+`init` writes the index the same way but keeps a `README.md` of yours
+(it says so; `--force` on `init` only overwrites `arch.yaml`). It numbers
+the sample ADR, `record-architecture-decisions`, after the highest ADR in
+the directory and adds none when the directory has one already (adr-tools
+writes the same one).
+
+The title is the first `# ` heading (after any front matter). The status is
+the first line of a `## Status` section; else the `status:` of the front
+matter (MADR); else a `Status:` line between the title and the first `##`
+heading (`* Status: accepted`, `**Status:** accepted`). No status shows
+as a dash.
+
 ### Rules are strict: nothing is dropped silently
 
 A rule that is quietly ignored leaves a repo looking enforced when it is not,
@@ -86,7 +136,8 @@ and every problem in every file is listed in one run:
 - Each side of a `forbid-import` is one layer name or module prefix; spaces
   in it (`handlers -> db because layering`) are an error - explain after a `#`.
 - Unknown keys in `arch.yaml` (`path:` for `paths:`) are errors with a
-  did-you-mean. Prefix a key with `x-` to keep a note there.
+  did-you-mean. Prefix a key with `x-` to keep a note there, at the top
+  level or in a layer (`x-owner: platform team`).
 - A heading such as `### Constraints` is not `## Constraints`, so the rules
   below it would not be read: that is a warning.
 - A repo with no rules at all fails (exit 2) unless you pass `--allow-empty`:
@@ -102,13 +153,21 @@ and every problem in every file is listed in one run:
   its imports cannot be checked, but pattern rules still run on its text.
 - **JS/TS/Go/Rust/Java/Ruby/PHP** use a heuristic extractor (a small
   tokenizer, not a parser): comments and string literals are ignored and
-  multi-line statements are read whole. See *Languages: exact support*
-  below; `--strict-py-only` disables it.
+  multi-line statements are read whole, in time linear in the size of the
+  file whatever it holds. A Rust or PHP file whose `use` lists are nested
+  more than 16 deep, or are so tangled that they would need far more work
+  than that, is reported as `unparsable` like a Python file that Python
+  cannot parse. See *Languages: exact support* below;
+  `--strict-py-only` disables the extractor.
 - `drift` compares commits: the violations at `HEAD` against those at the
   base ref, both read out of git (`git diff -z`, `git cat-file`) - it never
   touches your working tree, uncommitted edits are ignored, and file names
   with non-ASCII characters work. Renamed files are followed. `git blame`
-  tags each new violation with its introducing commit.
+  tags each new violation with its introducing commit. When `--root` (or the
+  working directory) is a folder inside a larger repository - a package in a
+  monorepo - `drift` looks only at the files under it and names them from it,
+  exactly as `check` does; changes next door are neither counted nor checked,
+  and a file moved across the boundary counts as added or deleted.
 - A git problem (unknown ref, a shallow clone without the history, fewer
   commits than the default `--since HEAD~5`, git missing) is an `error:`
   with a `hint:` and exit 2 - never a traceback and never exit 1. In GitHub
@@ -170,8 +229,9 @@ Warnings flag rules and layers that cover nothing, which usually means a typo:
 a layer whose paths match no scanned source file, a `forbid-pattern` or
 `require-pattern` glob that matches no scanned file, the `from` side of a
 `forbid-import` that matches no layer name or path, a `to` side that looks
-like a misspelt layer, an unparsable or unreadable source file. Pattern
-rules apply to the scanned source files only
+like a misspelt layer, an unparsable or unreadable source file, and an ADR
+directory that is missing, empty or not the only one (see *Where the ADRs
+are*). Pattern rules apply to the scanned source files only
 (`.py .js .jsx .ts .tsx .mjs .cjs .go .rs .java .rb .php`). `--strict` turns
 any warning into exit 2.
 
@@ -187,8 +247,13 @@ Or use the bundled composite action (needs Python on the runner):
 - uses: actions/checkout@v4
 - uses: calasdan-sketch/adr-drift@main
   with:
-    args: --baseline .adr-baseline.json   # optional
+    args: --adr-dir doc/adr --baseline .adr-baseline.json   # optional
 ```
+
+The action runs `python -m adr_drift check <args>`, so `args` takes anything
+`check` takes, including `--root` and `--adr-dir` (they are accepted after the
+command name). The text is split on spaces without any quoting, so a path
+with a space in it cannot be passed.
 
 `--fail-on none` reports without failing. With no rules at all, `check`
 exits 2 (nothing is enforced) unless you pass `--allow-empty` (in the action:

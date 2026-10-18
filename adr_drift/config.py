@@ -1,4 +1,4 @@
-"""Config + ADR loading: arch.yaml and docs/adr/*.md Constraints sections.
+"""Config + ADR loading: arch.yaml and the Constraints sections of the ADRs.
 
 Loading is strict on purpose. A rule that is silently dropped leaves the
 repo looking enforced when it is not, so anything that looks like a rule
@@ -10,23 +10,36 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import posixpath
 import re
 
 from . import miniyaml
 from . import rules as rules_mod
 
-DEFAULT_ADR_DIR = "docs/adr"
+#: Where ADRs are looked for when --adr-dir is not given: the first of these
+#: directories that exists is read (adr-tools writes doc/adr, MADR
+#: docs/decisions). docs/adr is also where `init` and `new` create one.
+ADR_DIR_CANDIDATES = ("docs/adr", "doc/adr", "docs/decisions",
+                      "docs/architecture/decisions", "adr", "decisions")
+DEFAULT_ADR_DIR = ADR_DIR_CANDIDATES[0]
 ARCH_FILE = "arch.yaml"
+
+#: Directories that are never entered below an ADR directory (hidden ones
+#: are skipped too).
+_ADR_SKIP_DIRS = frozenset({"node_modules", "__pycache__"})
 
 CONSTRAINTS_RE = re.compile(
     r"^##\s+Constraints\s*$", re.IGNORECASE | re.MULTILINE)
 
 _H2_RE = re.compile(r"^##\s")
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+# No lazy group followed by \s*$ here or in rules._RULE_RE: on a line with a
+# long run of blanks that is tried at every position, which is quadratic.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
 ARCH_KEYS = ("layers", "rules")
 LAYER_KEYS = ("name", "paths")
+#: A key with this prefix is a note, at the top level and in a layer.
+NOTE_KEY_PREFIX = "x-"
 
 
 class ConfigError(ValueError):
@@ -53,10 +66,22 @@ def _lines(text: str) -> "list[str]":
 
 def _without_html_comments(lines: "list[str]") -> "list[str]":
     """The lines with every <!-- ... --> blanked out (a commented-out rule
-    is an example, not a rule); line numbers are preserved."""
-    text = _HTML_COMMENT_RE.sub(
-        lambda m: "\n" * m.group(0).count("\n"), "\n".join(lines))
-    return text.split("\n")
+    is an example, not a rule); line numbers are preserved. An opener with
+    no closer is not a comment. (str.find, not a regex: <!-- .*? --> looks
+    for its closer again from every opener, which is quadratic.)"""
+    text = "\n".join(lines)
+    parts: "list[str]" = []
+    pos = 0
+    while True:
+        start = text.find("<!--", pos)
+        end = text.find("-->", start + 4) if start >= 0 else -1
+        if end < 0:
+            break      # no closer after this opener, so none after a later one
+        parts.append(text[pos:start])
+        parts.append("\n" * text.count("\n", start, end))
+        pos = end + 3
+    parts.append(text[pos:])
+    return "".join(parts).split("\n")
 
 
 def _find_line(lines, pattern: str, start: int = 0) -> int:
@@ -131,14 +156,14 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
                         f"{type(data).__name__}")
         data = {}
     for key in data:
-        if key in ARCH_KEYS or str(key).startswith("x-"):
+        if key in ARCH_KEYS or str(key).startswith(NOTE_KEY_PREFIX):
             continue
         line = _find_line(lines, "^" + re.escape(str(key)) + r"\s*:")
         problems.append(
             f"{_where(ARCH_FILE, line)}: unknown key {key!r}"
             f"{rules_mod.did_you_mean(key, ARCH_KEYS)} "
             f"(allowed: {', '.join(ARCH_KEYS)}; prefix a note key with "
-            "'x-' to keep it)")
+            f"'{NOTE_KEY_PREFIX}' to keep it)")
     layers = _load_layers(data.get("layers"), lines, problems)
     out = _load_rules(data.get("rules"), lines, problems)
     if own and problems:
@@ -163,13 +188,15 @@ def _load_layers(raw, lines, problems) -> "list[dict]":
             continue
         label = str(item.get("name") or f"layers[{i}]")
         for key in item:
-            if key not in LAYER_KEYS:
-                line = _find_line(lines, r'^\s*-?\s*' + re.escape(str(key))
-                                  + r'\s*:')
+            if key not in LAYER_KEYS and not str(key).startswith(
+                    NOTE_KEY_PREFIX):
+                line = _find_line(lines, r'^[ \t]*(?:-[ \t]*)?'
+                                  + re.escape(str(key)) + r'\s*:')
                 problems.append(
                     f"{_where(ARCH_FILE, line)}: layer {label!r}: unknown key "
                     f"{key!r}{rules_mod.did_you_mean(key, LAYER_KEYS)} "
-                    f"(allowed: {', '.join(LAYER_KEYS)})")
+                    f"(allowed: {', '.join(LAYER_KEYS)}; prefix a note key "
+                    f"with '{NOTE_KEY_PREFIX}' to keep it)")
         name = item.get("name")
         if name is None or str(name).strip() == "":
             problems.append(f"{ARCH_FILE}: layers[{i}] has no 'name'")
@@ -235,13 +262,219 @@ def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
     return out
 
 
-def adr_files(root: str, adr_dir: str = DEFAULT_ADR_DIR) -> "list[str]":
+def adr_files(root: str, adr_dir: str = DEFAULT_ADR_DIR,
+              problems: "list[str] | None" = None) -> "list[str]":
+    """The ADR files below one directory: every .md file in it and in its
+    subdirectories (docs/adr/2024/...), except README.md (the index) and
+    anything under a hidden directory. Sorted by the '/'-joined path below
+    the directory, so the order is the same on every platform. A directory
+    that cannot be read is appended to `problems` (it must not turn into
+    "no ADRs" unnoticed)."""
     d = os.path.join(root, adr_dir)
     if not os.path.isdir(d):
         return []
+
+    def unreadable(e: OSError) -> None:
+        if problems is not None:
+            problems.append(
+                f"cannot read directory {e.filename} "
+                f"({e.strerror or type(e).__name__}): the ADRs in it were "
+                "NOT read")
+
+    found: "list[str]" = []
+    for dirpath, dirnames, filenames in os.walk(d, onerror=unreadable):
+        dirnames[:] = [n for n in dirnames
+                       if not n.startswith(".") and n not in _ADR_SKIP_DIRS]
+        found.extend(os.path.join(dirpath, f) for f in filenames
+                     if f.endswith(".md") and f != "README.md")
     return sorted(
-        os.path.join(d, f) for f in os.listdir(d)
-        if f.endswith(".md") and f != "README.md")
+        found, key=lambda p: os.path.relpath(p, d).replace(os.sep, "/"))
+
+
+def _dir_list(adr_dir) -> "list[str]":
+    """--adr-dir as a list: None (search), one name, or several."""
+    if adr_dir is None:
+        return []
+    if isinstance(adr_dir, str):
+        return [adr_dir]
+    return list(adr_dir)
+
+
+def _same_dir(a: str, b: str) -> bool:
+    def norm(d: str) -> str:
+        return posixpath.normpath(d.replace("\\", "/"))
+    return norm(a) == norm(b)
+
+
+def primary_adr_dir(root: str, adr_dir=None) -> str:
+    """The directory `new`, `index` and `init` write to (relative to root):
+    the first --adr-dir, else the first candidate that exists, else
+    docs/adr."""
+    asked = _dir_list(adr_dir)
+    if asked:
+        return asked[0]
+    for candidate in ADR_DIR_CANDIDATES:
+        if os.path.isdir(os.path.join(root, candidate)):
+            return candidate
+    return DEFAULT_ADR_DIR
+
+
+@dataclasses.dataclass
+class AdrSearch:
+    files: list        # the ADR files to read, in order
+    warnings: list     # whatever could make "no violations" mean "nothing read"
+    primary: str       # see primary_adr_dir()
+
+
+def find_adrs(root: str, adr_dir=None) -> AdrSearch:
+    """Locate the ADR files of a repository.
+
+    Without --adr-dir the first of ADR_DIR_CANDIDATES that exists is read
+    (any other candidate that holds ADR files is reported, not read in
+    silence); with one or more --adr-dir exactly those are read. Directories
+    are searched recursively. Whatever could make a green result mean
+    "nothing was read" - a directory that is missing, one that is empty, ADR
+    files next door - comes back as a warning.
+    """
+    asked = _dir_list(adr_dir)
+    warnings: "list[str]" = []
+    existing = [c for c in ADR_DIR_CANDIDATES
+                if os.path.isdir(os.path.join(root, c))]
+    if asked:
+        use = []
+        for d in asked:
+            if os.path.isdir(os.path.join(root, d)):
+                use.append(d)
+                continue
+            near = [c for c in existing if not _same_dir(c, d)]
+            hint = (f" ({near[0]} exists: did you mean --adr-dir {near[0]}?)"
+                    if near else "")
+            warnings.append(f"ADR directory {d} not found, so no ADRs were "
+                            f"read from it{hint}")
+    else:
+        use = existing[:1]
+        for other in existing[1:]:
+            n = len(adr_files(root, other))
+            if n:
+                warnings.append(
+                    f"{other} also holds {n} ADR file{'' if n == 1 else 's'} "
+                    f"that {'was' if n == 1 else 'were'} NOT read ({use[0]} "
+                    f"is the one used); to read both, pass --adr-dir "
+                    f"{use[0]} --adr-dir {other}")
+    files: "list[str]" = []
+    seen: "set[str]" = set()
+    for d in use:
+        for path in adr_files(root, d, warnings):
+            key = os.path.normcase(os.path.realpath(path))
+            if key not in seen:
+                seen.add(key)
+                files.append(path)
+    if not files and (use or not asked):
+        where = (f"in {', '.join(asked)}" if asked else
+                 f"(looked in {', '.join(ADR_DIR_CANDIDATES)})")
+        warnings.append(
+            f"no ADR files found {where}: only the rules in "
+            f"{ARCH_FILE} are checked" + ("" if asked else
+                                          "; if your ADRs are elsewhere, "
+                                          "pass --adr-dir DIR"))
+    return AdrSearch(files, warnings, primary_adr_dir(root, adr_dir))
+
+
+def next_adr_number(root: str, adr_dir: str) -> int:
+    """The number after the highest one among the ADR files below the
+    directory (1 when there are none)."""
+    best = 0
+    for path in adr_files(root, adr_dir):
+        m = re.match(r"(\d+)[-_]", os.path.basename(path))
+        if m:
+            best = max(best, int(m.group(1)))
+    return best + 1
+
+
+# -- title and status of an ADR ------------------------------------------------
+
+_TITLE_RE = re.compile(r"#[ \t]+(.+)$")
+_STATUS_HEADING_RE = re.compile(r"##[ \t]+status[ \t]*$", re.IGNORECASE)
+_FRONT_STATUS_RE = re.compile(r"status[ \t]*:[ \t]*(.*)$", re.IGNORECASE)
+# "Status: x", "* Status: x", "- Status: x", "**Status:** x", "**Status**: x"
+_STATUS_LINE_RE = re.compile(
+    r"[ \t]*(?:[-*+][ \t]+)?(?:\*\*|__)?status(?:\*\*|__)?[ \t]*:"
+    r"(?:\*\*|__)?[ \t]*(.*)$", re.IGNORECASE)
+_YAML_COMMENT_RE = re.compile(r"[ \t]#")
+#: How far below the title a `Status:` line may be (and never past the first
+#: `##` heading): below that it is prose.
+_STATUS_ZONE = 40
+
+
+def _front_matter(lines: "list[str]") -> "tuple[list[str], int]":
+    """(the lines between the `---` fences at the top of the file, the index
+    of the first line after them); ([], 0) when the file has none."""
+    if lines and lines[0].rstrip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].rstrip() in ("---", "..."):
+                return lines[1:i], i + 1
+    return [], 0
+
+
+def _yaml_scalar(value: str) -> str:
+    """A front matter value without its quotes or its trailing comment."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end].strip()
+    return _YAML_COMMENT_RE.split(value, 1)[0].strip()
+
+
+def _status_section(body: "list[str]") -> str:
+    """The first line under the first `## Status` heading ("" if the section
+    is empty: the next heading is not a status)."""
+    for i, line in enumerate(body):
+        if _STATUS_HEADING_RE.match(line):
+            for j in range(i + 1, len(body)):
+                text = body[j].strip()
+                if text:
+                    return "" if text.startswith("#") else text
+            return ""
+    return ""
+
+
+def _status_line(body: "list[str]") -> str:
+    """A `Status: x` line (also `* Status: x`, `**Status:** x`) between the
+    title and the first `##` heading."""
+    for line in body[:_STATUS_ZONE]:
+        if _H2_RE.match(line):
+            break
+        m = _STATUS_LINE_RE.match(line)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+
+def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
+    """(title, status) of an ADR given its lines (HTML comments already
+    blanked); "" for what is not there.
+
+    The title is the first `# ` heading after any front matter (a `#` line
+    inside the front matter is a YAML comment). The status is, in this order,
+    the first line of a `## Status` section, the `status:` of the front matter
+    (MADR) or a `Status:` line under the title."""
+    front, start = _front_matter(lines)
+    body = lines[start:]
+    title = ""
+    for line in body:
+        m = _TITLE_RE.match(line)
+        if m and m.group(1).strip():
+            title = m.group(1).strip()
+            break
+    status = _status_section(body)
+    if not status:
+        for line in front:
+            m = _FRONT_STATUS_RE.match(line)
+            if m:
+                status = _yaml_scalar(m.group(1))
+                break
+    return title, status or _status_line(body)
 
 
 def parse_adr(path: str, display: "str | None" = None,
@@ -262,18 +495,15 @@ def parse_adr(path: str, display: "str | None" = None,
     if m:
         info["number"] = m.group(1)
         info["title"] = m.group(2).replace("-", " ").replace("_", " ")
-    m = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
-    if m:
-        info["title"] = m.group(1).strip()
-    m = re.search(r"^##\s+Status\s*$\n(.+?)(?=^##\s|\Z)",
-                  text, re.MULTILINE | re.DOTALL | re.IGNORECASE)
-    if m:
-        info["status"] = m.group(1).strip().splitlines()[0].strip()
+    lines = _without_html_comments(_lines(text))
+    title, status = adr_title_and_status(lines)
+    info["title"] = title or info["title"]
+    info["status"] = status
     if not parse_rules:
         return info
     problems: "list[str]" = []
     in_section = False
-    for number, raw in enumerate(_without_html_comments(_lines(text)), 1):
+    for number, raw in enumerate(lines, 1):
         if CONSTRAINTS_RE.match(raw):
             in_section = True
             continue
@@ -307,13 +537,17 @@ def parse_adr(path: str, display: "str | None" = None,
     return info
 
 
-def load_all(root: str, adr_dir: str = DEFAULT_ADR_DIR) -> Loaded:
-    """Everything in one pass; ConfigError lists the problems of ALL files."""
+def load_all(root: str, adr_dir=None) -> Loaded:
+    """Everything in one pass; ConfigError lists the problems of ALL files.
+
+    `adr_dir` is None (look in the usual places), one directory or a list of
+    them; see find_adrs()."""
     problems: "list[str]" = []
     layers, arch_rules = load_arch_yaml(root, problems)
     adrs: "list[dict]" = []
-    warnings: "list[str]" = []
-    for p in adr_files(root, adr_dir):
+    search = find_adrs(root, adr_dir)
+    warnings: "list[str]" = list(search.warnings)
+    for p in search.files:
         shown = os.path.relpath(p, root).replace(os.sep, "/")
         try:
             adrs.append(parse_adr(p, display=shown))
@@ -330,7 +564,7 @@ def load_all(root: str, adr_dir: str = DEFAULT_ADR_DIR) -> Loaded:
     return Loaded(layers, all_rules, adrs, warnings)
 
 
-def load_all_rules(root: str, adr_dir: str = DEFAULT_ADR_DIR
+def load_all_rules(root: str, adr_dir=None
                    ) -> "tuple[list[dict], list[rules_mod.Rule], list[dict]]":
     loaded = load_all(root, adr_dir)
     return loaded.layers, loaded.rules, loaded.adrs

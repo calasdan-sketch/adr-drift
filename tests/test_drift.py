@@ -21,8 +21,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from _support import (GitCase, commit_all, git, init_git, make_repo, run_main,
-                      write_files)
+from _support import (GitCase, chdir, commit_all, git, init_git, make_repo,
+                      run_main, write_files)
 
 ARCH = ('layers:\n'
         '  - name: handlers\n    paths: ["src/handlers/**"]\n'
@@ -216,6 +216,120 @@ class TestRange(DriftCase):
                                     "--format", "json")
         self.assertEqual(code, 1, out + err)
         self.assertEqual(self.new_files(out), ["src/handlers/c.py"])
+
+
+class TestRootBelowTheGitTopLevel(DriftCase):
+    """A package inside a monorepo: --root (or the working directory) is
+    below the git top-level.
+
+    git names files from the top-level while layer globs are relative to the
+    root, so `drift` printed "no new drift (2 file(s) changed)" and exit 0
+    for a violation `check` found (and counted files outside the root).
+    """
+
+    PKG = "pr\u00f6j caf\u00e9"          # a space and non-ASCII, on purpose
+
+    def mono(self, pkg=None):
+        pkg = pkg or self.PKG
+        files = {f"{p}/{rel}": body for p in (pkg, "other")
+                 for rel, body in CLEAN.items()}
+        root = init_git(make_repo(files))
+        commit_all(root, "clean start")
+        return root, os.path.join(root, pkg)
+
+    def both(self, root, pkg=None, name="src/handlers/b.py"):
+        """The same violation, committed inside the package and in the
+        unrelated `other/` next to it."""
+        self.commit(root, {f"{pkg or self.PKG}/{name}": BAD,
+                           f"other/{name}": BAD}, "violations")
+
+    def triples(self, out):
+        return sorted((v["file"], v["line"], v["rule"]) for v in json.loads(out))
+
+    def test_root_option_below_the_top_level_finds_the_violation(self):
+        root, proj = self.mono()
+        self.both(root)
+        code, out, err = run_main("--root", proj, "drift", "--since", "HEAD~1",
+                                  "--format", "json")
+        self.assertEqual(code, 1, out + err)
+        # named from the root (like `check`), and nothing from other/
+        self.assertEqual(self.new_files(out), ["src/handlers/b.py"])
+
+    def test_working_directory_below_the_top_level(self):
+        root, proj = self.mono()
+        self.both(root)
+        with chdir(proj):
+            code, out, err = run_main("drift", "--since", "HEAD~1",
+                                      "--format", "json")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.new_files(out), ["src/handlers/b.py"])
+
+    def test_drift_and_check_agree_for_the_same_root(self):
+        root, proj = self.mono()
+        self.both(root)
+        c_code, c_out, c_err = run_main("--root", proj, "check",
+                                        "--format", "json")
+        d_code, d_out, d_err = run_main("--root", proj, "drift", "--since",
+                                        "HEAD~1", "--format", "json")
+        self.assertEqual((c_code, d_code), (1, 1), c_err + d_err)
+        self.assertEqual(self.triples(c_out), self.triples(d_out))
+
+    def test_files_outside_the_root_are_not_counted_or_reported(self):
+        root, proj = self.mono()
+        self.both(root)
+        code, out, err = self.drift(proj, "--since", "HEAD~1")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("1 NEW violation(s)", out)
+        self.assertNotIn("other", out)
+        # a harmless change inside and outside: one file here, not two
+        self.commit(root, {f"{self.PKG}/src/handlers/a.py": "x = 2\n",
+                           "other/src/handlers/a.py": "x = 2\n"})
+        code, out, err = self.drift(proj, "--since", "HEAD~1")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("no new drift since HEAD~1 (1 file(s) changed", out)
+
+    def test_a_change_only_outside_the_root_is_no_change_here(self):
+        root, proj = self.mono()
+        self.commit(root, {"other/src/handlers/b.py": BAD})
+        code, out, err = self.drift(proj, "--since", "HEAD~1")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("no source files changed since HEAD~1", out)
+        code, out, err = self.drift(proj, "--since", "HEAD~1", "--format", "json")
+        self.assertEqual((code, json.loads(out)), (0, []))
+
+    def test_new_violations_below_the_top_level_carry_their_commit(self):
+        root, proj = self.mono()
+        self.both(root)
+        sha = git(root, "rev-parse", "HEAD").strip()[:7]
+        code, out, err = self.drift(proj, "--since", "HEAD~1")
+        self.assertIn(f"src/handlers/b.py:1 [{sha}]", out)
+
+    def test_moving_a_violating_file_across_the_root_boundary(self):
+        root, proj = self.mono()
+        # different enough that git does not pair the two as one rename
+        padding = "".join(f"value_{i} = {i}\n" for i in range(60))
+        self.commit(root, {"other/src/handlers/m.py": BAD,
+                           f"{self.PKG}/src/handlers/v.py": BAD + padding},
+                    "two files")
+        git(root, "mv", "other/src/handlers/m.py",
+            f"{self.PKG}/src/handlers/m.py")
+        git(root, "mv", f"{self.PKG}/src/handlers/v.py",
+            "other/src/handlers/v.py")
+        commit_all(root, "move one in, one out")
+        code, out, err = self.drift(proj, "--since", "HEAD~1",
+                                    "--format", "json")
+        # seen from the root: m.py is a new file (a new violation), v.py is gone
+        self.assertEqual((code, self.new_files(out)), (1, ["src/handlers/m.py"]))
+        code, out, err = self.drift(proj, "--since", "HEAD~1")
+        self.assertIn("1 fixed since HEAD~1", out)
+        self.assertIn("src/handlers/v.py", out)
+
+    def test_plain_ascii_package_name(self):
+        root, proj = self.mono("proj")
+        self.both(root, "proj")
+        code, out, err = self.drift(proj, "--since", "HEAD~1", "--format", "json")
+        self.assertEqual((code, self.new_files(out)),
+                         (1, ["src/handlers/b.py"]), err)
 
 
 class TestJsonIsAlwaysJson(DriftCase):

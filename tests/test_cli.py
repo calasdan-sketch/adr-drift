@@ -12,7 +12,7 @@ from contextlib import redirect_stdout
 
 from adr_drift import cli as cli_mod
 
-from _support import GitCase
+from _support import GitCase, make_repo, run_main
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "fixtures", "shop")
@@ -297,6 +297,24 @@ class TestDrift(GitCase):  # GitCase: git ignores the machine's own config
 
 
 
+ACTION_YML = os.path.join(REPO_ROOT, "action.yml")
+
+ARCH_AB = ('layers:\n  - name: a\n    paths: ["a/**"]\n'
+           '  - name: b\n    paths: ["b/**"]\n'
+           'rules:\n  - "forbid-pattern: a/**.py !~ eval"\n')
+ADR_A_B = ("# 1: Layers\n\n## Status\n\nAccepted\n\n## Constraints\n\n"
+           "- forbid-import: a -> b\n")
+
+
+def adr_in_unusual_place():
+    """A repo whose only forbid-import rule sits in doc/decisions/ (not in
+    docs/adr) and is violated by a/x.py."""
+    return make_repo({"arch.yaml": ARCH_AB,
+                      "doc/decisions/0001-layers.md": ADR_A_B,
+                      "a/x.py": "from b import thing\n",
+                      "b/__init__.py": "thing = 1\n"})
+
+
 class TestAction(unittest.TestCase):
     def test_action_yml_runs_check(self):
         from adr_drift import miniyaml
@@ -308,6 +326,88 @@ class TestAction(unittest.TestCase):
         step = data["runs"]["steps"][0]
         self.assertIn("adr_drift check", step["run"])
         self.assertEqual(step["shell"], "bash")
+
+    def _check_command(self) -> str:
+        """The action's `adr_drift check ...` command, as action.yml has it."""
+        from adr_drift import miniyaml
+        with open(ACTION_YML, encoding="utf-8") as f:
+            data = miniyaml.safe_load(f.read())
+        run = data["runs"]["steps"][0]["run"]
+        command = run.split("&&")[-1].strip()
+        self.assertEqual(command, "python -m adr_drift check $ADR_DRIFT_ARGS")
+        return command
+
+    def test_args_input_after_check_may_hold_adr_dir_and_root(self):
+        # The action appends its `args` input after `check`; an option that
+        # belongs to the whole tool used to be "unrecognized arguments".
+        command = self._check_command()
+        root = adr_in_unusual_place()
+        args = f"--adr-dir doc/decisions --root {root}"
+        argv = command.replace("$ADR_DRIFT_ARGS", args).split()[3:]
+        self.assertEqual(argv[0], "check")
+        code, out, err = run_main(*argv)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("a/x.py", out)
+        self.assertNotIn("unrecognized", err)
+
+    @unittest.skipIf(os.name == "nt",
+                     "on Windows `bash` is usually the WSL launcher, which cannot "
+                     "see Windows paths; the action runs under Git Bash there")
+    @unittest.skipUnless(shutil.which("bash"), "the action's shell is bash")
+    def test_the_actions_command_line_in_a_real_shell(self):
+        command = self._check_command().replace(
+            "python -m adr_drift", '"$PYBIN" -m adr_drift')
+        root = adr_in_unusual_place()
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+        env.update(PYBIN=sys.executable, PYTHONPATH=REPO_ROOT,
+                   ADR_DRIFT_ARGS="--adr-dir doc/decisions --strict")
+        p = subprocess.run(["bash", "-c", command], cwd=root, env=env,
+                           capture_output=True, timeout=120)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn(b"a/x.py", p.stdout)
+        self.assertNotIn(b"unrecognized", p.stderr)
+
+
+class TestOptionsBeforeAndAfterTheSubcommand(unittest.TestCase):
+    """--root and --adr-dir are accepted on both sides of the subcommand."""
+
+    def test_every_subcommand_takes_them(self):
+        for cmd in (["init"], ["check"], ["baseline"], ["drift"], ["index"],
+                    ["new", "A title"]):
+            args = cli_mod.parse_args(
+                [*cmd, "--root", "/r", "--adr-dir", "d/adr"])
+            self.assertEqual((args.root, args.adr_dir), ("/r", ["d/adr"]), cmd)
+
+    def test_options_before_the_subcommand_are_not_reset_by_it(self):
+        # argparse copies a sub-parser's defaults over the top-level values
+        args = cli_mod.parse_args(
+            ["--root", "/r", "--adr-dir", "d/adr", "check"])
+        self.assertEqual((args.root, args.adr_dir), ("/r", ["d/adr"]))
+
+    def test_defaults_are_unchanged(self):
+        args = cli_mod.parse_args(["check"])
+        self.assertEqual((args.root, args.adr_dir), (os.getcwd(), None))
+
+    def test_adr_dir_on_both_sides_is_joined(self):
+        args = cli_mod.parse_args(["--adr-dir", "a", "--adr-dir", "b",
+                                   "check", "--adr-dir", "c"])
+        self.assertEqual(args.adr_dir, ["a", "b", "c"])
+
+    def test_both_spellings_give_the_same_result(self):
+        root = adr_in_unusual_place()
+        before = run_main("--root", root, "--adr-dir", "doc/decisions",
+                          "check", "--format", "json")
+        after = run_main("check", "--format", "json", "--root", root,
+                         "--adr-dir", "doc/decisions")
+        self.assertEqual(before, after)
+        self.assertEqual(before[0], 1, before)
+
+    def test_help_of_a_subcommand_lists_them(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            run_cli("check", "--help")
+        self.assertIn("--adr-dir", out.getvalue())
+        self.assertIn("--root", out.getvalue())
 
 
 class TestVersion(unittest.TestCase):
@@ -423,12 +523,23 @@ class TestWindowsConsole(unittest.TestCase):
         self.assertIn(b"[x] 1 architecture violation(s)", raw.getvalue())
         clean = tempfile.mkdtemp()
         shutil.copy(os.path.join(FIXTURE, "arch.yaml"), clean)
+        shutil.copytree(os.path.join(FIXTURE, "docs"),
+                        os.path.join(clean, "docs"))
         code, out = self._run_on_stream("cp1252", "--root", clean, "check")
         self.assertEqual(code, 0)
-        self.assertIn(b"[ok] no architecture drift \x97 all ADRs hold", out)
+        self.assertIn(
+            b"[ok] no architecture drift \x97 all ADRs hold (2 read)", out)
         # pure-ASCII console: the em dash falls back too
         code, out = self._run_on_stream("ascii", "--root", clean, "check")
-        self.assertIn(b"[ok] no architecture drift -- all ADRs hold", out)
+        self.assertIn(
+            b"[ok] no architecture drift -- all ADRs hold (2 read)", out)
+        # no ADR at all: never "all ADRs hold"
+        bare = tempfile.mkdtemp()
+        shutil.copy(os.path.join(FIXTURE, "arch.yaml"), bare)
+        code, out = self._run_on_stream("cp1252", "--root", bare, "check")
+        self.assertEqual(code, 0)
+        self.assertIn(b"[ok] no architecture drift \x97 0 ADRs read", out)
+        self.assertNotIn(b"all ADRs hold", out)
         code, out = self._run_on_stream("ascii", "--root", tempfile.mkdtemp(),
                                         "check", "--fail-on", "none")
         self.assertEqual(code, 0)

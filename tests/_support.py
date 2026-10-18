@@ -28,6 +28,17 @@ def write_files(root: str, files: dict) -> str:
     return root
 
 
+@contextlib.contextmanager
+def chdir(path: str):
+    """Run the block with `path` as the working directory."""
+    before = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
 def make_repo(files: dict) -> str:
     """A fresh temp directory holding `files`."""
     return write_files(tempfile.mkdtemp(), files)
