@@ -12,6 +12,8 @@ from contextlib import redirect_stdout
 
 from adr_drift import cli as cli_mod
 
+from _support import GitCase
+
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "fixtures", "shop")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,14 +59,17 @@ class TestInit(unittest.TestCase):
 
 
 class TestInitThenCheck(unittest.TestCase):
-    def test_flat_repo_init_then_check_exits_0(self):
+    def test_flat_repo_init_then_check_exits_2_until_a_rule_is_enabled(self):
         tmp = tempfile.mkdtemp()
         with open(os.path.join(tmp, "main.py"), "w", encoding="utf-8") as f:
             f.write("print('hi')\n")
         self.assertEqual(run_cli("--root", tmp, "init"), 0)
         with open(os.path.join(tmp, "arch.yaml"), encoding="utf-8") as f:
             self.assertIn("layers: []", f.read())
-        self.assertEqual(run_cli("--root", tmp, "check"), 0)
+        # Nothing is enforced yet: a green check would be a lie (exit 2),
+        # unless the caller says they are adopting gradually.
+        self.assertEqual(run_cli("--root", tmp, "check"), 2)
+        self.assertEqual(run_cli("--root", tmp, "check", "--allow-empty"), 0)
 
     def test_sample_adr_has_no_live_constraints(self):
         tmp = tempfile.mkdtemp()
@@ -75,7 +80,8 @@ class TestInitThenCheck(unittest.TestCase):
         from adr_drift import config
         _l, rules, _a = config.load_all_rules(tmp)
         self.assertEqual(rules, [])
-        self.assertEqual(run_cli("--root", tmp, "check"), 0)
+        self.assertEqual(run_cli("--root", tmp, "check"), 2)
+        self.assertEqual(run_cli("--root", tmp, "check", "--allow-empty"), 0)
 
     def test_check_without_config_still_fails_closed(self):
         self.assertEqual(run_cli("--root", tempfile.mkdtemp(), "check"), 2)
@@ -195,7 +201,7 @@ def git(tmp, *args):
                    capture_output=True)
 
 
-class TestDrift(unittest.TestCase):
+class TestDrift(GitCase):  # GitCase: git ignores the machine's own config
     def _make_repo(self) -> str:
         tmp = tempfile.mkdtemp()
         git(tmp, "init", "-q")
@@ -302,6 +308,28 @@ class TestAction(unittest.TestCase):
         step = data["runs"]["steps"][0]
         self.assertIn("adr_drift check", step["run"])
         self.assertEqual(step["shell"], "bash")
+
+
+class TestVersion(unittest.TestCase):
+    """The version lives in three places; they must not drift apart."""
+
+    def test_pyproject_package_and_cli_agree(self):
+        import re
+        import adr_drift
+        with open(os.path.join(REPO_ROOT, "pyproject.toml"),
+                  encoding="utf-8") as f:
+            m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', f.read())
+        self.assertIsNotNone(m, "pyproject.toml has no version")
+        self.assertEqual(adr_drift.__version__, m.group(1))
+        self.assertEqual(cli_mod.VERSION, m.group(1))
+
+    def test_version_flag_prints_it(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            run_cli("--version")
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(),
+                         "adr-drift " + cli_mod.VERSION)
 
 
 class TestSym(unittest.TestCase):

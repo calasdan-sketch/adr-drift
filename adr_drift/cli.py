@@ -13,19 +13,23 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import errno
 import json
 import os
 import re
 import sys
 
+from . import __version__
 from . import config as config_mod
+from . import diag as diag_mod
 from . import engine as engine_mod
 from . import githelp
+from . import langs as langs_mod
 from . import rules as rules_mod
 from . import scanner as scanner_mod
 
-VERSION = "0.1.0"
+VERSION = __version__
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
              "dist", "build", ".tox", "vendor", "docs"}
@@ -146,12 +150,67 @@ def cmd_init(args) -> int:
     print(f"wrote {config_mod.ARCH_FILE} "
           f"({len(layers)} layers: {', '.join(l['name'] for l in layers)})")
     print(f"sample ADR: {os.path.relpath(sample, root)}")
-    print("Next: tighten the rules in arch.yaml, then run `adr-drift check`.")
+    print("Next: enable at least one rule in arch.yaml, then run "
+          "`adr-drift check`.")
+    print("(With no rules `check` exits 2, because nothing is enforced; "
+          "pass --allow-empty to accept that while you adopt gradually.)")
     return 0
 
 
-def _load(root, adr_dir):
-    return config_mod.load_all_rules(root, adr_dir)
+def _load_or_report(root: str, adr_dir: str):
+    """config_mod.load_all(), or None after printing every problem found
+    (one `error: file:line: what` per line on stderr)."""
+    try:
+        return config_mod.load_all(root, adr_dir)
+    except config_mod.ConfigError as e:
+        for problem in e.problems:
+            print(f"error: {problem}", file=sys.stderr)
+        n = len(e.problems)
+        print(f"error: {n} problem{'' if n == 1 else 's'} in the "
+              "configuration; nothing was checked", file=sys.stderr)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+    return None
+
+
+def _no_rules_message() -> str:
+    return (f"no rules found {sym('—')} run `adr-drift init` or add a "
+            "## Constraints section to an ADR.")
+
+
+def _nothing_to_enforce(args) -> int:
+    """No rules at all. A green result would be a lie, so this is exit 2
+    unless the caller opted in (--allow-empty) or asked for a report-only
+    run (--fail-on none). JSON mode keeps stdout a valid array either way."""
+    allowed = (getattr(args, "allow_empty", False)
+               or getattr(args, "fail_on", "violations") == "none")
+    message = _no_rules_message()
+    if not allowed:
+        print(message, file=sys.stderr)
+        print("error: nothing is enforced, so a passing check would mean "
+              "nothing; add a rule, or pass --allow-empty while you adopt "
+              "adr-drift gradually.", file=sys.stderr)
+        return 2
+    if getattr(args, "format", "human") == "json":
+        print("[]")
+        print(message, file=sys.stderr)
+    else:
+        print(message)
+    return 0
+
+
+def _verdict(args, violations, diag) -> int:
+    """The exit code: 1 for violations, 2 for warnings under --strict."""
+    if getattr(args, "fail_on", "violations") == "none":
+        return 0
+    if violations:
+        return 1
+    if getattr(args, "strict", False) and diag.warnings:
+        n = len(diag.warnings)
+        print(f"error: --strict: {n} warning{'' if n == 1 else 's'} "
+              "(above) treated as errors", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _print_violations(violations, fmt: str) -> None:
@@ -175,60 +234,69 @@ def _print_violations(violations, fmt: str) -> None:
 
 def cmd_check(args) -> int:
     root = args.root
-    try:
-        layers, all_rules, adrs = _load(root, args.adr_dir)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
         return 2
-    if not all_rules:
-        print(f"no rules found {sym('—')} run `adr-drift init` or add a "
-              "## Constraints section to an ADR.")
-        # Fresh `init` (arch.yaml present, rules still commented) is a
-        # configured repo with nothing to enforce yet; no config at all is not.
-        configured = os.path.isfile(os.path.join(root, config_mod.ARCH_FILE))
-        return 0 if args.fail_on == "none" or configured else 2
-    violations = engine_mod.check(root, layers, all_rules,
-                                  strict_py_only=args.strict_py_only)
+    diag = diag_mod.Diagnostics()
+    for message in loaded.warnings:
+        diag.warn(message)
+    if not loaded.rules:
+        return _nothing_to_enforce(args)
+    entries = None
     if args.baseline:
-        keys = _load_baseline(args.baseline, root)
-        if keys is None:
+        entries = _load_baseline(args.baseline, root)
+        if entries is None:
             return 2
-        violations = [v for v in violations
-                      if (v.file, v.line, v.rule.describe()) not in keys]
+    violations = engine_mod.check(root, loaded.layers, loaded.rules,
+                                  strict_py_only=args.strict_py_only,
+                                  diag=diag)
+    if entries is not None:
+        violations = engine_mod.not_baselined(violations, entries)
     _print_violations(violations, args.format)
-    if violations and args.fail_on != "none":
-        return 1
-    return 0
+    return _verdict(args, violations, diag)
 
 
-def _load_baseline(baseline: str, root: str) -> set | None:
-    """Violation identity triples from a baseline file.
+def _load_baseline(baseline: str, root: str) -> "list[dict] | None":
+    """The entries of a baseline file (see `adr-drift baseline`).
 
-    Returns None (after printing an error) when the file can't be read:
+    Returns None (after printing an error) when the file can't be used:
     failing closed beats silently dropping the grandfather list.
     """
     path = baseline if os.path.isabs(baseline) else os.path.join(root, baseline)
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"error: cannot read baseline {path}: {e}", file=sys.stderr)
         return None
-    keys = set()
-    for item in data:
-        keys.add((item.get("file"), item.get("line"), item.get("rule")))
-    return keys
+    if not isinstance(data, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("file"), str)
+            and isinstance(item.get("rule"), str) for item in data):
+        print(f"error: baseline {path} is not a list of violations (each "
+              "needs a 'file' and a 'rule'); rewrite it with "
+              "`adr-drift baseline`", file=sys.stderr)
+        return None
+    return data
 
 
 def cmd_baseline(args) -> int:
     root = args.root
-    try:
-        layers, all_rules, _adrs = _load(root, args.adr_dir)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
         return 2
-    violations = engine_mod.check(root, layers, all_rules,
-                                  strict_py_only=args.strict_py_only)
+    diag = diag_mod.Diagnostics()
+    for message in loaded.warnings:
+        diag.warn(message)
+    if not loaded.rules and not args.allow_empty:
+        # An empty baseline grandfathers nothing: a mistake, not a result.
+        print(_no_rules_message(), file=sys.stderr)
+        print("error: nothing is enforced, so there is nothing to record; "
+              "pass --allow-empty to write an empty baseline.",
+              file=sys.stderr)
+        return 2
+    violations = engine_mod.check(root, loaded.layers, loaded.rules,
+                                  strict_py_only=args.strict_py_only,
+                                  diag=diag)
     out = (args.output if os.path.isabs(args.output)
            else os.path.join(root, args.output))
     with open(out, "w", encoding="utf-8") as f:
@@ -240,58 +308,82 @@ def cmd_baseline(args) -> int:
     return 0
 
 
+_SOURCE_EXTS = scanner_mod.PY_EXTS | scanner_mod.GENERIC_EXTS
+
+
+def _is_source(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _SOURCE_EXTS
+
+
+def _git_failed(e: "githelp.GitError") -> int:
+    print(f"error: {e}", file=sys.stderr)
+    if e.hint:
+        print(f"hint: {e.hint}", file=sys.stderr)
+    return 2
+
+
 def cmd_drift(args) -> int:
     root = args.root
-    if not githelp.is_repo(root):
-        print("error: not a git repo", file=sys.stderr)
-        return 2
     try:
-        layers, all_rules, _adrs = _load(root, args.adr_dir)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+        githelp.require_repo(root)
+    except githelp.GitError as e:
+        return _git_failed(e)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
         return 2
+    layers, all_rules = loaded.layers, loaded.rules
+    diag = diag_mod.Diagnostics()
+    for message in loaded.warnings:
+        diag.warn(message)
     if not all_rules:
-        print(f"no rules found {sym('—')} nothing to drift from.")
-        return 0
+        return _nothing_to_enforce(args)
 
-    changed = [p for p in githelp.changed_files(root, args.since)
-               if os.path.splitext(p)[1].lower()
-               in (scanner_mod.PY_EXTS | scanner_mod.GENERIC_EXTS)]
+    # Compare commits: the base ref against HEAD. Both sides are read out of
+    # git, so the working tree (uncommitted edits) never matters, and a
+    # non-ASCII name is whatever git says it is.
+    try:
+        githelp.head_commit(root)
+        base = githelp.resolve_commit(root, args.since)
+        changed = [c for c in githelp.changes(root, base)
+                   if _is_source(c.path) or _is_source(c.old_path)]
+        blobs = githelp.read_blobs(
+            root, [b for c in changed for b in (c.old_blob, c.new_blob)])
+    except githelp.GitError as e:
+        return _git_failed(e)
     if not changed:
-        print(f"no source files changed since {args.since} "
-              f"{sym('—')} no drift")
-        return 0
+        if args.format == "json":
+            print("[]")
+        else:
+            print(f"no source files changed since {args.since} "
+                  f"{sym('—')} no drift")
+        return _verdict(args, [], diag)
 
-    def entries_for(get_content) -> list:
-        entries = []
-        for rel in changed:
-            content = get_content(rel)
-            if content is None:
-                continue
-            imports, _eng = scanner_mod.extract_imports(rel, content)
-            layer = engine_mod._file_layer(layers, rel)
-            entries.append((rel, layer, imports, content))
-        return entries
+    quiet = diag_mod.Diagnostics(echo=False)  # the base side: warn once
+    go_module = langs_mod.go_module_path(root)
 
-    now_entries = entries_for(
-        lambda rel: open(os.path.join(root, rel), encoding="utf-8",
-                         errors="replace").read()
-        if os.path.isfile(os.path.join(root, rel)) else None)
-    base_entries = entries_for(
-        lambda rel: githelp.file_at_ref(root, args.since, rel))
+    def entry(path, data, sink):
+        imports, _eng = scanner_mod.extract_imports(
+            path, data, diag=sink, go_module=go_module)
+        return (path, engine_mod._file_layer(layers, path), imports,
+                scanner_mod.decode_source(path, data))
 
-    now_v = {(v.file, v.line, v.rule.describe())
-             for v in engine_mod.evaluate(now_entries, layers, all_rules)}
-    base_v = {(v.file, v.line, v.rule.describe())
-              for v in engine_mod.evaluate(base_entries, layers, all_rules)}
-    new_keys = now_v - base_v
-    fixed_keys = base_v - now_v
-    new_violations = [v for v in engine_mod.evaluate(
-        now_entries, layers, all_rules)
-        if (v.file, v.line, v.rule.describe()) in new_keys]
-    fixed_violations = [v for v in engine_mod.evaluate(
-        base_entries, layers, all_rules)
-        if (v.file, v.line, v.rule.describe()) in fixed_keys]
+    now_entries, base_entries, renames = [], [], {}
+    for c in changed:
+        if c.status == "R":
+            renames[c.old_path] = c.path
+        now = blobs.get(c.new_blob) if c.new_blob and _is_source(c.path) else None
+        if now is not None:
+            now_entries.append(entry(c.path, now, diag))
+        old = (blobs.get(c.old_blob)
+               if c.old_blob and _is_source(c.old_path) else None)
+        if old is not None:
+            base_entries.append(entry(c.old_path, old, quiet))
+
+    new_violations, fixed_violations = engine_mod.new_and_fixed(
+        engine_mod.evaluate(base_entries, layers, all_rules),
+        engine_mod.evaluate(now_entries, layers, all_rules), renames)
+    fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
+                        for v in fixed_violations]
 
     if args.format == "json":
         # Stable contract: the JSON list is the NEW violations, as before.
@@ -316,9 +408,7 @@ def cmd_drift(args) -> int:
             for v in fixed_violations:
                 print(f"  {v.file}:{v.line or sym('—')}: {v.detail} (fixed)")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
-    if new_violations and args.fail_on != "none":
-        return 1
-    return 0
+    return _verdict(args, new_violations, diag)
 
 
 def cmd_new(args) -> int:
@@ -340,7 +430,8 @@ def cmd_new(args) -> int:
 
 def cmd_index(args) -> int:
     adr_dir = os.path.join(args.root, args.adr_dir)
-    adrs = [config_mod.parse_adr(p)
+    # Metadata only: the index must still build while a constraint is broken.
+    adrs = [config_mod.parse_adr(p, parse_rules=False)
             for p in config_mod.adr_files(args.root, args.adr_dir)]
     lines = ["# Architecture Decision Records\n",
              "| # | Title | Status |",
@@ -360,7 +451,12 @@ def cmd_index(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="adr-drift",
-        description="Deterministic architecture tests: keep ADRs mechanically true.")
+        description="Deterministic architecture tests: keep ADRs mechanically true.",
+        epilog="exit codes: 0 ok, 1 violations found, 2 configuration or "
+               "usage error (an unparsable rule, no rules at all, a git "
+               "problem, --strict with warnings). Warnings and errors go "
+               "to stderr; stdout carries only the report (with --format "
+               "json always a JSON array).")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     p.add_argument("--root", default=os.getcwd(),
                    help="Repo root (default: cwd).")
@@ -380,6 +476,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--baseline", default=None, metavar="FILE",
                    help="Grandfather violations listed in FILE "
                         "(written by `adr-drift baseline`).")
+    c.add_argument("--allow-empty", action="store_true",
+                   help="Exit 0 when there are no rules at all (default: "
+                        "exit 2, because nothing would be enforced).")
+    c.add_argument("--strict", action="store_true",
+                   help="Treat warnings (a rule or layer that matches no "
+                        "file, an unparsable file, ...) as errors: exit 2.")
 
     b = sub.add_parser("baseline",
                        help="Record current violations as a grandfather file.")
@@ -388,6 +490,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: .adr-baseline.json under --root).")
     b.add_argument("--strict-py-only", action="store_true",
                    help="Skip the regex fallback for non-Python files.")
+    b.add_argument("--allow-empty", action="store_true",
+                   help="Write an empty baseline when there are no rules "
+                        "(default: exit 2).")
 
     d = sub.add_parser("drift", help="New violations since a git ref.")
     d.add_argument("--since", default="HEAD~5",
@@ -395,6 +500,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--format", choices=["human", "json"], default="human")
     d.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
+    d.add_argument("--allow-empty", action="store_true",
+                   help="Exit 0 when there are no rules at all (default: "
+                        "exit 2, because nothing would be enforced).")
+    d.add_argument("--strict", action="store_true",
+                   help="Treat warnings as errors: exit 2.")
 
     n = sub.add_parser("new", help="Create the next-numbered ADR.")
     n.add_argument("title")

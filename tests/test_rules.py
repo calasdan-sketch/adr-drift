@@ -79,6 +79,33 @@ class TestMatchGlob(unittest.TestCase):
     def test_no_match(self):
         self.assertFalse(r.match_glob("src/**.py", "tests/a.py"))
 
+    def test_slash_doublestar_slash_also_matches_zero_directories(self):
+        # "src/**/x.py" is x.py anywhere under src/, directly in it too.
+        self.assertTrue(r.match_glob("src/**/x.py", "src/x.py"))
+        self.assertTrue(r.match_glob("src/**/x.py", "src/a/x.py"))
+        self.assertTrue(r.match_glob("src/**/x.py", "src/a/b/x.py"))
+        self.assertTrue(r.match_glob("**/x.py", "x.py"))
+        self.assertTrue(r.match_glob("**/x.py", "a/b/x.py"))
+        self.assertTrue(r.match_glob("a/**/b/**/c.py", "a/b/c.py"))
+        self.assertTrue(r.match_glob("a/**/b/**/c.py", "a/x/b/y/c.py"))
+
+    def test_slash_doublestar_slash_does_not_overreach(self):
+        self.assertFalse(r.match_glob("src/**/x.py", "other/x.py"))
+        self.assertFalse(r.match_glob("src/**/x.py", "src/ax.py"))
+        self.assertFalse(r.match_glob("src/**/x.py", "src/x.pyc"))
+        self.assertFalse(r.match_glob("**/x.py", "ax.py"))
+        self.assertFalse(r.match_glob("a/**/b/**/c.py", "a/c.py"))
+
+    def test_windows_separators_and_case(self):
+        self.assertTrue(r.match_glob("src/**/x.py", "src\\a\\x.py"))
+        self.assertTrue(r.match_glob("src\\**\\x.py", "src/x.py"))
+        self.assertFalse(r.match_glob("src/**.py", "SRC/a.py"))  # case-sensitive
+
+    def test_a_single_star_stays_within_the_pattern(self):
+        self.assertTrue(r.match_glob("src/*.py", "src/a.py"))
+        self.assertFalse(r.match_glob("src/*.py", "src/a.js"))
+        self.assertFalse(r.match_glob("src/a?.py", "src/abc.py"))
+
 
 if __name__ == "__main__":
     unittest.main()

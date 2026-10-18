@@ -37,21 +37,23 @@ class TestPythonImports(unittest.TestCase):
 
 
 class TestGenericImports(unittest.TestCase):
+    # The language comes from the file name; see test_langs.py for the
+    # per-language details.
     def test_typescript(self):
         src = 'import { x } from "./utils";\nimport fs from "fs";\n'
-        mods = [m for m, _ in s.generic_imports(src)]
-        self.assertIn("./utils", mods)
+        mods = [m for m, _ in s.generic_imports(src, "src/a.ts")]
+        self.assertIn("src.utils", mods)  # relative: resolved to the repo
         self.assertIn("fs", mods)
 
     def test_go(self):
         src = 'import "fmt"\nimport (\n\t"os"\n)\n'
-        mods = [m for m, _ in s.generic_imports(src)]
-        self.assertIn("fmt", mods)
+        mods = [m for m, _ in s.generic_imports(src, "m.go")]
+        self.assertEqual(mods, ["fmt", "os"])
 
     def test_rust_use(self):
         src = "use std::collections::HashMap;\n"
-        mods = [m for m, _ in s.generic_imports(src)]
-        self.assertTrue(any("std" in m for m in mods))
+        mods = [m for m, _ in s.generic_imports(src, "m.rs")]
+        self.assertEqual(mods, ["std.collections.HashMap"])
 
 
 class TestExtract(unittest.TestCase):

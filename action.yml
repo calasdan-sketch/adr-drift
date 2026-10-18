@@ -2,7 +2,7 @@ name: adr-drift
 description: Fail the job when code drifts from arch.yaml and ADR constraints.
 inputs:
   args:
-    description: Extra arguments for `adr-drift check` (e.g. --baseline .adr-baseline.json).
+    description: Extra arguments for `adr-drift check` (e.g. --baseline .adr-baseline.json, --strict, --allow-empty).
     required: false
     default: ""
 runs:

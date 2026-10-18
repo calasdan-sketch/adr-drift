@@ -26,7 +26,7 @@ Or run without installing: `python3 -m adr_drift` from the repo root.
 ```bash
 cd your-repo
 python3 -m adr_drift init      # scaffold arch.yaml + sample ADR from folder layout
-# tighten the rules in arch.yaml, add ## Constraints to your ADRs
+# enable a rule in arch.yaml and/or add ## Constraints to your ADRs
 python3 -m adr_drift check     # verify; exit 1 on violations (CI-ready)
 # repo already has legacy violations? grandfather them, then enforce:
 python3 -m adr_drift baseline                    # record current violations
@@ -38,9 +38,9 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 | Command | What it does |
 |---|---|
 | `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index |
-| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations) |
+| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules) |
 | `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` |
-| `drift --since HEAD~5` | Report violations *introduced* since a git ref, plus violations *fixed* since then (pre-existing ones ignored) |
+| `drift --since HEAD~5` | Report violations *introduced* between a git ref and `HEAD`, plus violations *fixed* in that range (pre-existing ones ignored) |
 | `new "title"` | Create the next-numbered ADR from a template |
 | `index` | Regenerate the one-sentence-per-ADR index (`docs/adr/README.md`) |
 
@@ -61,19 +61,119 @@ Python relative imports resolve against the file's package
 and `from app.db import drivers` counts as importing `app.db.drivers`.
 JS/TS relative specifiers resolve against the importing file with the
 extension dropped (`"../db/config.js"` matches a `config.ts` module).
-To-side patterns resolve against layer paths too: in a `src/`-layout repo
-both `db.drivers` and `src.db.drivers` spellings match a `db` layer mapped
-to `src/db/**`.
+To-side patterns resolve against layer paths too, whichever way the code
+spells the import: a `db` layer mapped to `src/myapp/db/**` is reached by
+`import myapp.db.conn` (`src/` is the import root), `import src.myapp.db.conn`
+and, in a flat layout, `import db.conn` - a rule naming the layer (`db`) or
+any of those spellings matches all of them. Only the layer's leading
+directories are stripped, never its own, so `conn` alone matches nothing.
+
+### Rules are strict: nothing is dropped silently
+
+A rule that is quietly ignored leaves a repo looking enforced when it is not,
+so a rule that does not parse is an error (exit 2, `file:line` on stderr),
+and every problem in every file is listed in one run:
+
+- In `arch.yaml` a rule is one list item; quoting it is optional
+  (`- forbid-import: a -> b` works).
+- In an ADR, `## Constraints` is read line by line. A rule may be plain, a
+  list item (`-`, `*`, `1.`, `1)`), a task box (`- [ ]`), in `` `backticks` ``
+  or `**bold**`, optionally followed by a sentence of explanation. Ordinary
+  prose is ignored, and so is anything after a `#`.
+- A line that *looks* like a rule but is not one is an error: a misspelt
+  name (`forbid_import:`, `forbid-patern:`), a name with nothing after the
+  colon, a bare `a -> b` item, a rule name buried in the middle of a line.
+- Each side of a `forbid-import` is one layer name or module prefix; spaces
+  in it (`handlers -> db because layering`) are an error - explain after a `#`.
+- Unknown keys in `arch.yaml` (`path:` for `paths:`) are errors with a
+  did-you-mean. Prefix a key with `x-` to keep a note there.
+- A heading such as `### Constraints` is not `## Constraints`, so the rules
+  below it would not be read: that is a warning.
+- A repo with no rules at all fails (exit 2) unless you pass `--allow-empty`:
+  a green check that enforces nothing is worse than a red one.
 
 ## How it checks
 
 - **Python** is parsed with the real `ast` — no regex false positives from
-  comments or strings.
-- **JS/TS/Go/Rust/Java/Ruby/PHP** use a heuristic regex import extractor
-  (documented as such; `--strict-py-only` disables it).
-- `drift` compares violations at HEAD against the base ref via `git show` —
-  it never touches your working tree, and `git blame` tags each new
-  violation with its introducing commit.
+  comments or strings. Files are read as bytes, so a UTF-8 BOM and a
+  `# coding:` cookie work as they do for Python itself. A file Python cannot
+  parse (syntax error, NUL byte, nested too deeply, out of memory) is
+  reported as `unparsable` on stderr - a warning, or exit 2 under `--strict`:
+  its imports cannot be checked, but pattern rules still run on its text.
+- **JS/TS/Go/Rust/Java/Ruby/PHP** use a heuristic extractor (a small
+  tokenizer, not a parser): comments and string literals are ignored and
+  multi-line statements are read whole. See *Languages: exact support*
+  below; `--strict-py-only` disables it.
+- `drift` compares commits: the violations at `HEAD` against those at the
+  base ref, both read out of git (`git diff -z`, `git cat-file`) - it never
+  touches your working tree, uncommitted edits are ignored, and file names
+  with non-ASCII characters work. Renamed files are followed. `git blame`
+  tags each new violation with its introducing commit.
+- A git problem (unknown ref, a shallow clone without the history, fewer
+  commits than the default `--since HEAD~5`, git missing) is an `error:`
+  with a `hint:` and exit 2 - never a traceback and never exit 1. In GitHub
+  Actions, `drift` needs `actions/checkout` with `fetch-depth: 0`.
+
+### What counts as "the same violation"
+
+`check --baseline` and `drift` identify a violation by its **file, rule and
+what was found** (the imported module for `forbid-import`, the rule's pattern
+for the pattern rules) - not by its line number. Adding a docstring above a
+grandfathered import, or renaming the file, does not turn it into a new
+violation. When a file has several identical violations they are counted: a
+second `eval(` in a file that had one is reported as one new violation (which
+of the two is the new one is a best guess). A baseline written by 0.1.0 keeps
+working; a hand-made entry without `detail` still matches by exact file, line
+and rule.
+
+## Languages: exact support
+
+`forbid-import` needs to know a file's imports. Python is exact (`ast`:
+`import x`, `import x.y as z`, `from x import y`, relative imports resolved
+against the file's package; `importlib` and `__import__` calls are not
+seen). The rest is a heuristic extractor - read what it covers:
+
+| Language | Files | Recognised | Not recognised |
+|---|---|---|---|
+| JavaScript / TypeScript | `.js .jsx .ts .tsx .mjs .cjs` | `import x from "m"`, `import { a, b } from "m"` (also over several lines), `import * as ns from "m"`, `import type ... from "m"`, `import "m"`, `export ... from "m"`, `export * from "m"`, `import("m")`, `require("m")`, `import x = require("m")`; relative specifiers resolve against the file | path aliases (tsconfig `paths`, bundler aliases), non-literal `import(x)` / `require(x)`, `.vue` / `.svelte` files |
+| Go | `.go` | `import "m"`, aliased / `.` / `_` imports, grouped `import ( ... )`, raw-string paths; the module path in the root `go.mod` is removed from the repo's own packages (`github.com/acme/app/internal/db` is `internal/db`) | a `go.mod` below the root (multi-module repos), build tags |
+| Java | `.java` | `import a.b.C;`, `import static a.b.C.m;`, wildcards (`a.b.*` is `a.b`) | uses of a class in the same package (there is no import), fully qualified names in code |
+| Rust | `.rs` | `use a::b;`, nested trees `use a::{b::{c, d}, e as f, self}`, globs, `pub use`, `pub(crate) use`, `extern crate`, `mod x;`; `crate::`, `self::` and `super::` resolve against the file's module | macro-generated `use`, `#[path = "..."]` modules, paths used in code without a `use` |
+| PHP | `.php` | `use A\B;`, `use A\{B, C as D}`, `use function` / `use const`, `require` / `include` (`_once`) of a literal path or `__DIR__ . 'path'` | `dirname(__FILE__)`, dynamic includes, a namespace spelt in a different case than its directory |
+| Ruby | `.rb` | `require`, `require_relative`, `load`, `autoload` with a string literal, at the start of a line | a `require` after other code on the same line, computed paths |
+
+Rust and PHP names are matched dotted (`crate::db::x` is `db.x`,
+`App\Models\User` is `App.Models.User`); the other languages are matched as
+written, with `/` and `.` interchangeable. Layers are matched the same way
+as for Python, with their leading directories optional: a Java layer at
+`src/main/java/com/acme/db/**` is reached by `com.acme.db.Conn`.
+
+When forbid-import rules exist and **none** of a language's files contains an
+import the extractor recognises, `check` warns once for that language: the
+extractor is probably not seeing this codebase, and a rule that cannot see
+imports enforces nothing. `--strict` makes that an error.
+
+## Exit codes, warnings and output
+
+| Exit | Meaning |
+|---|---|
+| 0 | no violations (and, with `--strict`, no warnings) |
+| 1 | violations found (`--fail-on none` makes every run report-only: exit 0) |
+| 2 | the configuration or the invocation is wrong: unparsable rule, no rules, bad baseline, `--strict` with warnings |
+
+stdout carries only the report. With `--format json` it is always a bare
+array of violations (`[]` when clean) - or empty when the exit code is 2 -
+so `adr-drift check --format json | jq` never meets prose. Every warning and
+error goes to stderr as `warning: ...` / `error: ...`.
+
+Warnings flag rules and layers that cover nothing, which usually means a typo:
+a layer whose paths match no scanned source file, a `forbid-pattern` or
+`require-pattern` glob that matches no scanned file, the `from` side of a
+`forbid-import` that matches no layer name or path, a `to` side that looks
+like a misspelt layer, an unparsable or unreadable source file. Pattern
+rules apply to the scanned source files only
+(`.py .js .jsx .ts .tsx .mjs .cjs .go .rs .java .rb .php`). `--strict` turns
+any warning into exit 2.
 
 ## CI
 
@@ -90,22 +190,48 @@ Or use the bundled composite action (needs Python on the runner):
     args: --baseline .adr-baseline.json   # optional
 ```
 
-`--fail-on none` reports without failing. With no rules yet, `check` exits 0
-once `arch.yaml` exists (fresh `init`) and 2 when nothing is configured. JSON output is stable for tooling.
+`--fail-on none` reports without failing. With no rules at all, `check`
+exits 2 (nothing is enforced) unless you pass `--allow-empty` (in the action:
+`args: --allow-empty`), which is meant for adopting gradually: right after
+`init`, until the first rule is enabled.
 
-## Honest limits
+`drift` needs history. `actions/checkout` fetches a single commit by default,
+so give it `fetch-depth: 0` (otherwise `drift` exits 2 and says so). For a
+pull request compare against where the branch left the base:
+`adr-drift drift --since "$(git merge-base origin/main HEAD)"`.
 
-- The regex fallback for non-Python languages is heuristic — it can miss
-  exotic import forms. Python is precise; everything else is best-effort.
-- `drift` needs a git repo; `check` works anywhere.
-- Windows: files are always read and written as UTF-8, and on a console
-  that can't show ✓/✗ (cp1252 pipes) the report falls back to `[ok]`/`[x]`.
-- Rules are only as good as the constraints you write — `init` scaffolds,
-  you tighten.
+## Limitations
+
+- Only files with a source extension are scanned (`.py .js .jsx .ts .tsx
+  .mjs .cjs .go .rs .java .rb .php`), and not inside `.git`, `node_modules`,
+  `__pycache__`, `.venv`, `venv`, `dist`, `build`, `.tox` or `vendor`. A
+  `forbid-pattern` on YAML, Markdown or shell files matches nothing (you get
+  a warning).
+- Python is exact; every other language is a heuristic extractor (see
+  *Languages: exact support*): path aliases, computed paths and macros are
+  not seen. In Python, `importlib.import_module()` and `__import__()` are not
+  seen either; every `import` statement counts, also inside functions and
+  `if TYPE_CHECKING:` blocks.
+- `forbid-pattern` is matched line by line (it cannot span lines);
+  `require-pattern` searches the whole file.
+- A file belongs to the first layer whose paths match it.
+- Pattern violations are identified by file and rule, counted: swapping one
+  violation for another in the same file is not seen, and with several
+  identical violations in a file `drift` knows how many are new, not always
+  which.
+- `drift` compares `HEAD` with the ref itself, not with the merge base, and
+  ignores uncommitted edits. It needs a git repository with enough history;
+  `check` works anywhere.
+- Go: only the `go.mod` at the repo root is read.
+- Windows: files are always read and written as UTF-8, and on a console that
+  can't show the check marks (cp1252 pipes) the report falls back to
+  `[ok]`/`[x]`.
+- Rules are only as good as the constraints you write - `init` scaffolds
+  layers from the folder layout and writes no rule for you.
 
 ## Tests
 
-93/93 pass: `python3 -m unittest discover -s tests` (or `python -m pytest -q`)
+`python3 -m unittest discover -s tests` (or `python -m pytest -q`)
 
 ## License
 

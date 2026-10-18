@@ -120,6 +120,71 @@ class TestSrcLayoutToSide(unittest.TestCase):
         self.assertEqual(vs, [])
 
 
+class TestPackageUnderSrc(unittest.TestCase):
+    """src/<package>/<layer> layouts: code imports `myapp.db`, not `src.myapp.db`.
+
+    Regression: absolute imports of the package never matched a layer mapped
+    to src/myapp/db/**, so the rule silently never fired (while the relative
+    spelling of the same import did).
+    """
+
+    LAYERS = [
+        {"name": "handlers", "paths": ["src/myapp/handlers/**"]},
+        {"name": "db", "paths": ["src/myapp/db/**"]},
+        {"name": "persistence", "paths": ["src/store/**"]},
+    ]
+
+    def _hits(self, import_mod, rule_text):
+        rule = rules_mod.parse_rule_line(rule_text, source="arch.yaml")
+        entries = [("src/myapp/handlers/h.py", "handlers",
+                    [(import_mod, 1)], "")]
+        return e.evaluate(entries, self.LAYERS, [rule])
+
+    def test_absolute_import_of_the_package_matches_the_layer_name(self):
+        for mod in ("myapp.db", "myapp.db.conn", "src.myapp.db.conn"):
+            self.assertEqual(
+                len(self._hits(mod, "forbid-import: handlers -> db")), 1, mod)
+
+    def test_absolute_import_matches_a_dotted_layer_path(self):
+        self.assertEqual(len(self._hits(
+            "myapp.db.conn", "forbid-import: handlers -> myapp.db")), 1)
+        self.assertEqual(len(self._hits(
+            "myapp.db.conn", "forbid-import: handlers -> src.myapp.db")), 1)
+        self.assertEqual(len(self._hits(
+            "myapp.db.conn", "forbid-import: handlers -> db.conn")), 1)
+
+    def test_layer_name_may_differ_from_the_directory(self):
+        # `store` is imported unprefixed; its layer is called `persistence`.
+        self.assertEqual(len(self._hits(
+            "store.pg", "forbid-import: handlers -> persistence")), 1)
+
+    def test_unrelated_modules_are_not_swept_in(self):
+        self.assertEqual(self._hits("myapp.other", "forbid-import: handlers -> db"), [])
+        self.assertEqual(self._hits("conn", "forbid-import: handlers -> db"), [])
+        self.assertEqual(self._hits("myapp", "forbid-import: handlers -> db"), [])
+        self.assertEqual(self._hits(
+            "myapp.db.conn", "forbid-import: handlers -> conn"), [])
+
+    def test_slash_separated_specifiers_work_too(self):
+        self.assertEqual(len(self._hits(
+            "myapp/db/conn", "forbid-import: handlers -> db")), 1)
+
+    def test_cli_end_to_end(self):
+        import json
+        from _support import make_repo, run_main
+        root = make_repo({
+            "arch.yaml": ('layers:\n'
+                          '  - name: handlers\n    paths: ["src/myapp/handlers/**"]\n'
+                          '  - name: db\n    paths: ["src/myapp/db/**"]\n'
+                          'rules:\n  - "forbid-import: handlers -> db"\n'),
+            "src/myapp/handlers/h.py": "from myapp.db import conn\n",
+            "src/myapp/db/conn.py": "x = 1\n"})
+        code, out, err = run_main("--root", root, "check", "--format", "json")
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual([v["file"] for v in json.loads(out)],
+                         ["src/myapp/handlers/h.py"])
+
+
 class TestSyntaxErrorWarning(unittest.TestCase):
     def test_check_warns_and_keeps_other_violations(self):
         import io
