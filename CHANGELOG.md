@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.4
+
+- A report that cannot be written (`> /dev/full`, a full disk) now really
+  exits 2 with one `error:` line. In 0.1.3 the last flush at the end of the
+  run still failed with a traceback and exit 120. A closed pipe
+  (`adr-drift check | head -1`) still keeps the verdict as the exit code.
+- ADR files and `arch.yaml` are read like source files: only regular files,
+  at most 1 MiB, and an out-of-memory error is reported instead of crashing.
+  A link to `/dev/zero` inside `docs/adr` (or named `arch.yaml`) used to eat
+  all memory, or be mistaken for "no arch.yaml".
+- A link to a file inside the repository is checked as that file; a link that
+  leaves the repository is still reported as "not checked".
+- The release workflow only publishes a tag that sits on `main`, and the
+  build also runs the tests from the unpacked source distribution.
+
 ## 0.1.3
 
 - The package page on PyPI is complete again: licence (MIT), author, project

@@ -198,26 +198,21 @@ def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
     seen: dict[str, list[int]] = {}   # language -> [files, files with imports]
     for path in scanner_mod.iter_source_files(root):
         rel = _rel(root, path)
-        if not scanner_mod.is_regular(path):
+        try:
+            data = scanner_mod.read_regular(
+                path, scanner_mod.MAX_SOURCE_BYTES, root=root)
+        except scanner_mod.RefusedFile as e:
             # A committed link to /dev/zero would be read for ever, a named
             # pipe would block, a link out of the repo would be read from
-            # outside it: only regular files are opened.
-            diag.warn(f"{rel}: not a regular file (a link, device or pipe); "
-                      "not checked")
+            # outside it; a link that stays in the repo is checked as the
+            # file it points to.
+            diag.warn(f"{rel}: {e.strerror}; not checked")
             continue
-        try:
-            with open(path, "rb") as f:
-                data = f.read(scanner_mod.MAX_SOURCE_BYTES + 1)
         except (OSError, MemoryError) as e:
             # A file that cannot be read is not checked: never silently.
             diag.warn(f"{rel}: cannot read "
                       f"({getattr(e, 'strerror', None) or type(e).__name__})"
                       "; not checked")
-            continue
-        if len(data) > scanner_mod.MAX_SOURCE_BYTES:
-            diag.warn(f"{rel}: bigger than "
-                      f"{scanner_mod.MAX_SOURCE_BYTES // (1024 * 1024)} MiB; "
-                      "not checked")
             continue
         imports, engine = scanner_mod.extract_imports(
             rel, data, strict_py_only=strict_py_only, diag=diag,

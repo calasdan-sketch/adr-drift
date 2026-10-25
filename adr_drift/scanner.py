@@ -193,6 +193,69 @@ def is_regular(path: str) -> bool:
         return False
 
 
+#: The biggest ADR or arch.yaml that is read: they are prose and a few lines
+#: of rules, never megabytes.
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+class RefusedFile(OSError):
+    """A file adr-drift will not open; `strerror` says why in plain words."""
+
+    def __init__(self, why: str):
+        super().__init__(0, why)
+
+
+def _inside(real: str, real_root: str) -> bool:
+    real, real_root = os.path.normcase(real), os.path.normcase(real_root)
+    return real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def resolve_readable(path: str, root: "str | None" = None) -> str:
+    """The path to open for `path`, or RefusedFile.
+
+    A regular file is opened as it is. A link is followed only when it ends
+    at a regular file and, when `root` is given, that file lies inside
+    `root`: a link out of the repository is never read, and a link to
+    /dev/zero (a repository can hold one: git stores links) would be read
+    for ever. Devices, pipes and directories are refused."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as e:
+        raise RefusedFile(e.strerror or "cannot be read") from None
+    if stat.S_ISREG(mode):
+        return path
+    if not stat.S_ISLNK(mode):
+        raise RefusedFile("not a regular file (a device, pipe or directory)")
+    real = os.path.realpath(path)
+    try:
+        if not stat.S_ISREG(os.stat(real).st_mode):
+            raise RefusedFile("not a regular file (a link to a device, "
+                              "pipe or directory)")
+    except OSError:
+        raise RefusedFile("not a regular file (a link that leads nowhere)") from None
+    if root is not None and not _inside(real, os.path.realpath(root)):
+        raise RefusedFile("not a regular file (a link that leaves the "
+                          "repository)")
+    return real
+
+
+def read_regular(path: str, limit: int, root: "str | None" = None) -> bytes:
+    """The bytes of a regular file of at most `limit` bytes. Raises
+    RefusedFile (also an OSError) for a file that is not read: not regular,
+    a link out of `root`, or bigger than `limit`. MemoryError is the
+    caller's to handle."""
+    try:
+        real = resolve_readable(path, root)
+        with open(real, "rb") as f:
+            data = f.read(limit + 1)
+        if len(data) > limit:
+            raise RefusedFile(f"bigger than {limit // (1024 * 1024)} MiB")
+    except RefusedFile as e:
+        e.filename = path
+        raise
+    return data
+
+
 def iter_source_files(root: str) -> list[str]:
     skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
                  "dist", "build", ".tox", "vendor"}

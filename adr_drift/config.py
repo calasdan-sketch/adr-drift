@@ -15,6 +15,7 @@ import re
 
 from . import miniyaml
 from . import rules as rules_mod
+from . import scanner as scanner_mod
 
 #: Where ADRs are looked for when --adr-dir is not given: the first of these
 #: directories that exists is read (adr-tools writes doc/adr, MADR
@@ -131,15 +132,20 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
     then problems are appended to it and whatever did parse is returned.
     """
     path = os.path.join(root, ARCH_FILE)
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):  # a link to /dev/zero is not "missing"
         return [], []
     own = problems is None
     problems = [] if own else problems
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            text = f.read()
+        data = scanner_mod.read_regular(path, scanner_mod.MAX_CONFIG_BYTES,
+                                        root=root)
+        text = data.decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
-        problems.append(f"{ARCH_FILE}: cannot read ({e})")
+        problems.append(f"{ARCH_FILE}: cannot read "
+                        f"({getattr(e, 'strerror', None) or e})")
+        text = ""
+    except MemoryError:
+        problems.append(f"{ARCH_FILE}: cannot read (out of memory)")
         text = ""
     lines = _lines(text)
     data = None
@@ -478,7 +484,7 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
 
 
 def parse_adr(path: str, display: "str | None" = None,
-              parse_rules: bool = True) -> dict:
+              parse_rules: bool = True, root: "str | None" = None) -> dict:
     """Extract number, title, status, and constraint rules from an ADR.
 
     `display` is how the file is named in messages and rule sources (the
@@ -487,8 +493,14 @@ def parse_adr(path: str, display: "str | None" = None,
     Raises ConfigError (a ValueError) listing every bad constraint line.
     """
     shown = display or path
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        text = f.read()
+    # Only a regular file of a sane size is read: an ADR directory can hold
+    # a link to /dev/zero. RefusedFile is an OSError, MemoryError becomes one.
+    try:
+        data = scanner_mod.read_regular(path, scanner_mod.MAX_CONFIG_BYTES,
+                                        root=root)
+    except MemoryError:
+        raise scanner_mod.RefusedFile("out of memory") from None
+    text = data.decode("utf-8-sig", "replace")
     info: dict = {"path": path, "number": "", "title": "",
                   "status": "", "rules": [], "warnings": []}
     m = re.match(r"(\d+)[-_](.+)\.md$", os.path.basename(path))
@@ -550,11 +562,12 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     for p in search.files:
         shown = os.path.relpath(p, root).replace(os.sep, "/")
         try:
-            adrs.append(parse_adr(p, display=shown))
+            adrs.append(parse_adr(p, display=shown, root=root))
         except ConfigError as e:
             problems.extend(e.problems)
         except OSError as e:
-            problems.append(f"{shown}: cannot read ({e})")
+            problems.append(f"{shown}: cannot read "
+                            f"({e.strerror or e})")
     if problems:
         raise ConfigError(problems)
     all_rules = list(arch_rules)

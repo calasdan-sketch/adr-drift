@@ -510,7 +510,7 @@ def _write_index(root: str, adr_rel: str) -> int:
     -> how many there are."""
     adr_dir = os.path.join(root, adr_rel)
     # Metadata only: the index must still build while a constraint is broken.
-    adrs = [config_mod.parse_adr(p, parse_rules=False)
+    adrs = [config_mod.parse_adr(p, parse_rules=False, root=root)
             for p in config_mod.adr_files(root, adr_rel)]
     lines = [INDEX_MARKER + "\n",
              "# Architecture Decision Records\n",
@@ -735,54 +735,84 @@ class _PipeSafe:
         return getattr(self._stream, name)
 
 
+class _StreamState:
+    """What happened to the output streams while main() ran."""
+
+    def __init__(self):
+        self.write_error = None   # the OSError that stopped the output
+        self.reported = False     # an "error:" line already says so
+
+
 @contextlib.contextmanager
 def _closed_pipe_tolerant():
-    """Run the body with stdout and stderr wrapped in _PipeSafe."""
+    """Run the body with stdout and stderr wrapped in _PipeSafe. Yields a
+    _StreamState; a stream that cannot take its output (a full disk, `>
+    /dev/full`) is recorded there, never raised, because this runs after
+    the command: a traceback here would replace its exit code with 1 or
+    120."""
+    state = _StreamState()
     real = (sys.stdout, sys.stderr)  # either is None under pythonw
     safe = tuple(_PipeSafe(s) if s is not None else None for s in real)
     sys.stdout, sys.stderr = safe
     try:
-        yield
+        yield state
     finally:
-        try:
-            # Flush now, with the command done, while a closed pipe is
-            # still handled. A small output only ever sits in the buffer,
-            # so nothing has failed yet; left to the interpreter's flush
-            # at exit, the error would be "Exception ignored" and the exit
-            # code 120 instead of the command's own.
-            for s in safe:
-                if s is not None:
-                    s.flush()
-        finally:
-            sys.stdout, sys.stderr = real
+        # Flush now, with the command done, while a closed pipe is still
+        # handled. A small output only ever sits in the buffer, so nothing
+        # has failed yet; left to the interpreter's flush at exit, the
+        # error would be "Exception ignored" and the exit code 120 instead
+        # of the command's own.
+        for s, raw in zip(safe, real):
+            if s is None:
+                continue
+            try:
+                s.flush()
+            except (OSError, ValueError) as e:
+                if state.write_error is None:
+                    state.write_error = e
+                # what is left in the buffer must not fail again at exit
+                _discard_output(raw)
+        sys.stdout, sys.stderr = real
 
 
 def main(argv=None) -> int:
     _harden_streams()
     # `adr-drift check | head -1` must neither traceback nor change the exit
     # code (check's exit code is the verdict).
-    with _closed_pipe_tolerant():
+    with _closed_pipe_tolerant() as state:
         try:
-            return _main(argv)
+            rc = _main(argv)
         except OSError as e:
             # A file or stream the OS refused (a full disk under `> file`, an
             # unwritable stderr): exit 2, the documented "could not run"
             # code, never a traceback with 1, which means "violations found".
-            _fail_quietly(f"error: {e.strerror or type(e).__name__}"
-                          + (f": {e.filename}" if e.filename else ""))
-            return 2
+            state.reported = _fail_quietly(
+                f"error: {e.strerror or type(e).__name__}"
+                + (f": {e.filename}" if e.filename else ""))
+            rc = 2
         except MemoryError:
-            _fail_quietly("error: out of memory")
-            return 2
+            state.reported = _fail_quietly("error: out of memory")
+            rc = 2
+    if state.write_error is not None:
+        # The output could not be written (found when the streams were
+        # flushed). The verdict was never delivered: exit 2, one line.
+        if not state.reported:
+            e = state.write_error
+            _fail_quietly("error: could not write the output: "
+                          f"{getattr(e, 'strerror', None) or e}")
+        return 2
+    return rc
 
 
-def _fail_quietly(message: str) -> None:
-    """One line on stderr, if stderr can take it."""
+def _fail_quietly(message: str) -> bool:
+    """One line on stderr, if stderr can take it. True when it was said."""
     try:
         print(message, file=sys.stderr)
         sys.stderr.flush()
+        return True
     except (OSError, ValueError):
-        pass
+        _discard_output(sys.stderr)
+        return False
 
 
 def parse_args(argv=None) -> argparse.Namespace:
