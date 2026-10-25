@@ -16,8 +16,10 @@ PHP-only. ADR Drift is language-agnostic, repo-local, and CI-friendly.
 ## Install
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/adr-drift   # provides `adr-drift`
+pip install adr-drift   # provides `adr-drift`
 ```
+
+From source: `pip install git+https://github.com/calasdan-sketch/adr-drift`
 
 Or run without installing: `python3 -m adr_drift` from the repo root.
 
@@ -293,6 +295,17 @@ pull request compare against where the branch left the base:
   `[ok]`/`[x]`.
 - Rules are only as good as the constraints you write - `init` scaffolds
   layers from the folder layout and writes no rule for you.
+
+## Trusted rules
+
+`arch.yaml` and the ADR `## Constraints` sections are your configuration, and
+`forbid-pattern` / `require-pattern` take regular expressions from them. A
+pattern like `(a+)+$` can take for ever on a long line. When you run
+`adr-drift` on pull requests from people you do not trust, run it with the
+`arch.yaml` and ADRs of the base branch, not the pull request's own.
+
+Only regular files are read: a link (to a device, or out of the repository),
+a named pipe or a file over 4 MiB is reported as not checked.
 
 ## Tests
 

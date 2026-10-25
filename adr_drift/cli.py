@@ -762,7 +762,27 @@ def main(argv=None) -> int:
     # `adr-drift check | head -1` must neither traceback nor change the exit
     # code (check's exit code is the verdict).
     with _closed_pipe_tolerant():
-        return _main(argv)
+        try:
+            return _main(argv)
+        except OSError as e:
+            # A file or stream the OS refused (a full disk under `> file`, an
+            # unwritable stderr): exit 2, the documented "could not run"
+            # code, never a traceback with 1, which means "violations found".
+            _fail_quietly(f"error: {e.strerror or type(e).__name__}"
+                          + (f": {e.filename}" if e.filename else ""))
+            return 2
+        except MemoryError:
+            _fail_quietly("error: out of memory")
+            return 2
+
+
+def _fail_quietly(message: str) -> None:
+    """One line on stderr, if stderr can take it."""
+    try:
+        print(message, file=sys.stderr)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -777,6 +797,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def _main(argv) -> int:
     args = parse_args(argv)
+    root = getattr(args, "root", None)
+    if root is not None and not os.path.isdir(root):
+        print(f"error: --root: not a directory: {root}", file=sys.stderr)
+        return 2
     return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
             "drift": cmd_drift, "new": cmd_new,
             "index": cmd_index}[args.cmd](args)

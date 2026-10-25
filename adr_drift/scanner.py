@@ -13,6 +13,7 @@ import ast
 import io
 import os
 import re
+import stat
 import sys
 import tokenize
 
@@ -175,6 +176,21 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
             imports = langs.strip_go_module(imports, go_module)
         return imports, "regex"
     return [], "none"
+
+
+#: The biggest source file that is read (a bundle or a data dump with a source
+#: extension is not code anyone wrote): the read stops one byte past this.
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
+
+
+def is_regular(path: str) -> bool:
+    """A regular file: not a link (to a file, a directory, a device ...), not
+    a named pipe, not a device. Opening a link to /dev/zero reads for ever and
+    a repository can hold the link (git stores links)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def iter_source_files(root: str) -> list[str]:
