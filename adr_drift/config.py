@@ -57,6 +57,7 @@ class Loaded:
     rules: list
     adrs: list
     warnings: list
+    notes: list = dataclasses.field(default_factory=list)  # for --verbose
 
 
 def _lines(text: str) -> "list[str]":
@@ -483,6 +484,33 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
     return title, status or _status_line(body)
 
 
+#: A status that retires the ADR: "Superseded by ADR-0007", "Deprecated".
+#: Anchored at the start, so "Accepted (supersedes ADR-0002)" still counts.
+_RETIRED_RE = re.compile(r"[\W_]*(superseded|deprecated)\b", re.IGNORECASE)
+_TITLE_NUMBER_RE = re.compile(
+    r"(?:adr[ -]*)?\d+(?:[ \t]*[:.)]|[ \t]+[-\u2013\u2014])[ \t]*",
+    re.IGNORECASE)
+
+
+def retired_status(status: str) -> str:
+    """"superseded" or "deprecated" when the ADR's status says it no longer
+    holds, else ""."""
+    m = _RETIRED_RE.match(status or "")
+    return m.group(1).lower() if m else ""
+
+
+def _adr_number(path: str, lines: "list[str]") -> "int | None":
+    m = re.match(r"(\d+)[-_]", os.path.basename(path))
+    if m:
+        return int(m.group(1))
+    for line in lines:
+        h = _TITLE_RE.match(line)
+        if h:
+            n = re.match(r"(?:adr[ -]*)?(\d+)\b", h.group(1), re.IGNORECASE)
+            return int(n.group(1)) if n else None
+    return None
+
+
 def parse_adr(path: str, display: "str | None" = None,
               parse_rules: bool = True, root: "str | None" = None) -> dict:
     """Extract number, title, status, and constraint rules from an ADR.
@@ -511,7 +539,17 @@ def parse_adr(path: str, display: "str | None" = None,
     title, status = adr_title_and_status(lines)
     info["title"] = title or info["title"]
     info["status"] = status
+    info["retired"] = retired_status(status)
+    clean = _TITLE_NUMBER_RE.match(info["title"])
+    info["adr"] = {"number": _adr_number(path, lines),
+                   "title": (info["title"][clean.end():] if clean
+                             else info["title"]) or info["title"],
+                   "path": shown.replace(os.sep, "/")}
     if not parse_rules:
+        return info
+    if info["retired"]:
+        # A superseded or deprecated decision no longer constrains anyone:
+        # its Constraints are not read (so a stale line cannot break a run).
         return info
     problems: "list[str]" = []
     in_section = False
@@ -537,6 +575,7 @@ def parse_adr(path: str, display: "str | None" = None,
             problems.append(f"{_where(shown, number)}: {e}")
             continue
         if rule is not None:
+            rule.adr = info["adr"]
             info["rules"].append(rule)
             continue
         hint = rules_mod.rule_like_problem(line, listed)
@@ -571,10 +610,16 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     if problems:
         raise ConfigError(problems)
     all_rules = list(arch_rules)
+    notes: "list[str]" = []
     for a in adrs:
         all_rules.extend(a["rules"])
         warnings.extend(a["warnings"])
-    return Loaded(layers, all_rules, adrs, warnings)
+        if a["retired"]:
+            shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+            notes.append(
+                f"{shown}: status '{a['status']}': this ADR is {a['retired']}"
+                ", so its Constraints are not enforced")
+    return Loaded(layers, all_rules, adrs, warnings, notes)
 
 
 def load_all_rules(root: str, adr_dir=None

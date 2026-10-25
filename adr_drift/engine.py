@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import datetime
 import os
 import re
 
@@ -20,8 +21,12 @@ class Violation:
     file: str          # repo-relative path
     line: int          # 0 when the whole file is the subject
     detail: str
+    #: ISO date of a temporary exception that has run out ("" when the rule
+    #: never had one). Not part of what makes a violation the same one.
+    expired: str = ""
 
     def as_dict(self) -> dict:
+        """The stable core (what a baseline file stores)."""
         return {
             "rule": self.rule.describe(),
             "rule_source": (f"{self.rule.source}:{self.rule.line_no}"
@@ -31,6 +36,50 @@ class Violation:
             "detail": self.detail,
         }
 
+    def report_dict(self) -> dict:
+        """as_dict() plus what a reader needs to act: how to fix it, which
+        ADR it comes from and, for an exception that ran out, when."""
+        d = self.as_dict()
+        d["fix_hint"] = fix_hint(self)
+        d["adr"] = (dict(self.rule.adr) if self.rule.adr else None)
+        if self.expired:
+            d["exception_expired"] = self.expired
+        return d
+
+
+def adr_label(adr: "dict | None") -> str:
+    """"ADR 0002: No dynamic eval" (or "" for a rule from arch.yaml)."""
+    if not adr:
+        return ""
+    number = adr.get("number")
+    head = f"ADR {number:04d}" if isinstance(number, int) else "ADR"
+    title = adr.get("title") or ""
+    return f"{head}: {title}" if title else head
+
+
+def fix_hint(v: "Violation") -> str:
+    """One plain sentence on how to make the violation go away."""
+    rule = v.rule
+    where = f"{v.file}:{v.line}" if v.line else v.file
+    if rule.kind == "forbid-import":
+        mod = v.detail[len("imports "):] if v.detail.startswith(
+            "imports ") else v.detail
+        text = (f"Remove the import of {mod} at {where}, or reach it through "
+                "a layer that is allowed to use it.")
+    elif rule.kind == "forbid-pattern":
+        text = (f"Remove or rewrite the code at {where} that matches "
+                f"/{rule.regex}/.")
+    else:
+        text = f"Add code that matches /{rule.regex}/ to {v.file}."
+    if v.expired:
+        text += (f" The temporary exception ended on {v.expired}: fix the "
+                 "code, or (if the date was only a guess) set a new "
+                 "'allow-until' after agreeing it with the team.")
+    else:
+        text += (f" If the rule is out of date, change it in "
+                 f"{rule.source} instead.")
+    return text
+
 
 def identity(v: "Violation", renames: "dict | None" = None) -> tuple:
     """What makes a violation *the same one* from run to run: the file, the
@@ -38,6 +87,77 @@ def identity(v: "Violation", renames: "dict | None" = None) -> tuple:
     line, which moves whenever anything above it is edited. `renames` maps
     old paths to new ones, so a moved file keeps its violations."""
     return ((renames or {}).get(v.file, v.file), v.rule.describe(), v.detail)
+
+
+def apply_exceptions(violations: "list[Violation]", today: datetime.date
+                     ) -> "tuple[list[Violation], list[Violation]]":
+    """Split violations by temporary exceptions (`allow-until: DATE`).
+
+    -> (kept, allowed). A violation of a rule whose date is today or later is
+    allowed; one whose date has passed is kept and marked `expired`, so it
+    fails with a message that says why. Rules without a date are untouched.
+    """
+    kept: "list[Violation]" = []
+    allowed: "list[Violation]" = []
+    for v in violations:
+        until = v.rule.allow_until
+        if until is None:
+            kept.append(v)
+        elif today <= until:
+            allowed.append(v)
+        else:
+            kept.append(dataclasses.replace(v, expired=until.isoformat()))
+    return kept, allowed
+
+
+def exception_messages(all_rules: "list[rules_mod.Rule]",
+                       violations: "list[Violation]",
+                       allowed: "list[Violation]", today: datetime.date,
+                       complete: bool = True
+                       ) -> "tuple[list[str], list[str]]":
+    """(warnings, notes) about the temporary exceptions among `all_rules`.
+
+    `violations` are the ones that failed (expired exceptions among them),
+    `allowed` the ones an exception let through. A warning is something to
+    act on (an exception that has run out); a note is information. With
+    `complete` False (a partial scan, like drift) an expired exception with
+    no violation is not called unnecessary, because the scan did not look
+    at every file."""
+    warnings: "list[str]" = []
+    notes: "list[str]" = []
+    for rule in all_rules:
+        until = rule.allow_until
+        if until is None:
+            continue
+        mine = [v for v in violations if v.rule is rule]
+        let_through = [v for v in allowed if v.rule is rule]
+        where = rule.where()
+        if today > until:
+            days = (today - until).days
+            ago = f"{days} day{'' if days == 1 else 's'} ago"
+            if mine:
+                warnings.append(
+                    f"{where}: the temporary exception for rule "
+                    f"'{rule.describe()}' ended on {until.isoformat()} "
+                    f"({ago}); "
+                    + ("its 1 violation now fails" if len(mine) == 1 else
+                       f"its {len(mine)} violations now fail"))
+            elif complete:
+                warnings.append(
+                    f"{where}: the temporary exception for rule "
+                    f"'{rule.describe()}' ended on {until.isoformat()} "
+                    f"({ago}) and is no longer needed: delete "
+                    "'allow-until' from the rule")
+        else:
+            left = (until - today).days
+            when = ("today" if left == 0 else
+                    f"{left} more day{'' if left == 1 else 's'}")
+            notes.append(
+                f"{where}: temporary exception for rule '{rule.describe()}' "
+                f"until {until.isoformat()} (still valid {when}); it lets "
+                f"{len(let_through)} violation"
+                f"{'' if len(let_through) == 1 else 's'} through")
+    return warnings, notes
 
 
 def _unpaired(current: list, known: list) -> "tuple[list[int], list[int]]":

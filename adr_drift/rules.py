@@ -13,6 +13,7 @@ A rule is one line:
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import difflib
 import fnmatch
 import re
@@ -33,6 +34,12 @@ class Rule:
     # pattern rules
     glob: str = ""
     regex: str = ""
+    #: A temporary exception: violations of this rule are allowed up to and
+    #: including this date (`allow-until: YYYY-MM-DD` at the end of the line).
+    allow_until: "datetime.date | None" = None
+    #: The ADR this rule came from: {"number", "title", "path"}; None for a
+    #: rule in arch.yaml.
+    adr: "dict | None" = None
 
     def describe(self) -> str:
         if self.kind == "forbid-import":
@@ -61,8 +68,15 @@ def parse_rule_line(line: str, source: str = "",
     m = _RULE_RE.match(text)
     if not m:
         return None
+    allow_until = None
+    if ALLOW_UNTIL in text:
+        text, allow_until = split_allow_until(text, line.strip())
+        m = _RULE_RE.match(text)
+        if not m:
+            return None
     kind, rest = m.group(1), m.group(2)
-    rule = Rule(kind=kind, source=source, line_no=line_no, raw=line.strip())
+    rule = Rule(kind=kind, source=source, line_no=line_no, raw=line.strip(),
+                allow_until=allow_until)
     if kind == "forbid-import":
         parts = rest.split("->")
         if len(parts) != 2:
@@ -96,6 +110,50 @@ def parse_rule_line(line: str, source: str = "",
         except re.error as e:
             raise ValueError(f"bad {kind} regex in {line.strip()!r}: {e}")
     return rule
+
+
+#: The word that ends a rule line with a temporary exception:
+#: `forbid-import: a -> b  allow-until: 2026-12-31`.
+ALLOW_UNTIL = "allow-until"
+_ALLOW_TAIL_RE = re.compile(r"[ \t]*[:=][ \t]*(\S*)[ \t]*$")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
+
+
+def split_allow_until(text: str, shown: str
+                      ) -> "tuple[str, datetime.date | None]":
+    """(rule text without the exception, its date) for a line that may end
+    in `allow-until: YYYY-MM-DD` (`=` also works, handy in unquoted YAML).
+
+    A line that mentions `allow-until` followed by a colon or equals sign
+    but does not END with a valid date is an error: a typo here would
+    otherwise turn the exception into a rule that never fires, or into a
+    permanent one. A rule that merely contains the word (inside its regex,
+    say) is left alone."""
+    at = text.rfind(ALLOW_UNTIL)
+    tail = _ALLOW_TAIL_RE.match(text, at + len(ALLOW_UNTIL))
+    if tail is None:
+        # "allow-until" without ":" or "=" after it: just part of the rule
+        # unless the line is plainly an exception ("... allow-until 2026-..")
+        if re.search(r"[ \t]allow-until[ \t]+\d", text):
+            raise ValueError(
+                f"bad exception in {shown!r}: write it as "
+                f"'allow-until: YYYY-MM-DD' at the end of the rule")
+        return text, None
+    before = text[:at]
+    if at and not before[-1].isspace():
+        return text, None   # part of a longer word
+    value = tail.group(1)
+    if not _DATE_RE.match(value):
+        raise ValueError(
+            f"bad exception in {shown!r}: 'allow-until' needs a date like "
+            f"2026-12-31 (year-month-day), got {value!r}")
+    try:
+        date = datetime.date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"bad exception in {shown!r}: {value!r} is not a real date "
+            "(want YYYY-MM-DD)") from None
+    return before.rstrip(), date
 
 
 # -- Markdown decoration and "does this look like a rule?" -------------------

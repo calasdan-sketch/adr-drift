@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import errno
 import json
 import os
@@ -28,6 +29,7 @@ from . import engine as engine_mod
 from . import githelp
 from . import langs as langs_mod
 from . import rules as rules_mod
+from . import sarif as sarif_mod
 from . import scanner as scanner_mod
 
 VERSION = __version__
@@ -260,6 +262,9 @@ def _nothing_to_enforce(args) -> int:
     if getattr(args, "format", "human") == "json":
         print("[]")
         print(message, file=sys.stderr)
+    elif getattr(args, "format", "human") == "sarif":
+        print(json.dumps(sarif_mod.build([], [], VERSION), indent=2))
+        print(message, file=sys.stderr)
     else:
         print(message)
     return 0
@@ -283,9 +288,14 @@ def _adrs_read(n: int) -> str:
     return f"{n} ADR{'' if n == 1 else 's'} read"
 
 
-def _print_violations(violations, fmt: str, adr_count: int) -> None:
+def _print_violations(violations, fmt: str, adr_count: int,
+                      rules=()) -> None:
     if fmt == "json":
-        print(json.dumps([v.as_dict() for v in violations], indent=2))
+        print(json.dumps([v.report_dict() for v in violations], indent=2))
+        return
+    if fmt == "sarif":
+        print(json.dumps(sarif_mod.build(violations, rules, VERSION),
+                         indent=2))
         return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
@@ -304,7 +314,81 @@ def _print_violations(violations, fmt: str, adr_count: int) -> None:
         for v in by_file[path]:
             where = f":{v.line}" if v.line else ""
             print(f"    {path}{where}: {v.detail}")
-            print(f"      rule: {v.rule.describe()} ({v.rule.source})")
+            _print_rule_lines(v, indent="      ")
+
+
+def _print_rule_lines(v, indent: str) -> None:
+    """The lines under a violation: its rule, the ADR it comes from, how to
+    fix it."""
+    print(f"{indent}rule: {v.rule.describe()} ({v.rule.source})")
+    label = engine_mod.adr_label(v.rule.adr)
+    if label:
+        print(f"{indent}{label} ({v.rule.adr['path']})")
+    if v.expired:
+        print(f"{indent}the temporary exception for this rule ended on "
+              f"{v.expired}")
+    print(f"{indent}fix: {engine_mod.fix_hint(v)}")
+
+
+def _today(args) -> datetime.date:
+    """Today, or the date given with --today (reproducible runs)."""
+    given = getattr(args, "today", None)
+    return given if given else datetime.date.today()
+
+
+def _date_arg(value: str) -> datetime.date:
+    try:
+        if len(value) != 10:
+            raise ValueError
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a date like 2026-12-31") from None
+
+
+def _settle_exceptions(args, loaded, violations, diag, complete=True):
+    """Apply the temporary exceptions: -> the violations that fail.
+
+    Adds a warning for every exception that has run out, one line on stderr
+    for violations an exception let through (always: green must not hide
+    them) and, with --verbose, the details."""
+    if not any(r.allow_until for r in loaded.rules):
+        return violations
+    today = _today(args)
+    kept, allowed = engine_mod.apply_exceptions(violations, today)
+    warnings, notes = engine_mod.exception_messages(
+        loaded.rules, kept, allowed, today, complete=complete)
+    for message in warnings:
+        diag.warn(message)
+    if allowed:
+        n = len(allowed)
+        print(f"note: {n} violation{'' if n == 1 else 's'} allowed by "
+              "temporary exceptions (allow-until)"
+              + ("" if getattr(args, "verbose", False)
+                 else "; --verbose lists them"), file=sys.stderr)
+    if getattr(args, "verbose", False):
+        for message in notes:
+            print(f"note: {message}", file=sys.stderr)
+        for v in allowed:
+            where = f"{v.file}:{v.line}" if v.line else v.file
+            print(f"note: allowed until {v.rule.allow_until.isoformat()}: "
+                  f"{where}: {v.detail}", file=sys.stderr)
+    return kept
+
+
+def _retired_hint(args, loaded) -> None:
+    """When retired ADRs are why there is nothing to enforce, say so."""
+    if loaded.notes and not getattr(args, "verbose", False):
+        n = len(loaded.notes)
+        print(f"note: {n} ADR{'' if n == 1 else 's'} superseded or "
+              "deprecated, so not enforced; --verbose lists them",
+              file=sys.stderr)
+
+
+def _verbose_notes(args, loaded) -> None:
+    if getattr(args, "verbose", False):
+        for message in loaded.notes:
+            print(f"note: {message}", file=sys.stderr)
 
 
 def cmd_check(args) -> int:
@@ -315,7 +399,9 @@ def cmd_check(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _verbose_notes(args, loaded)
     if not loaded.rules:
+        _retired_hint(args, loaded)
         return _nothing_to_enforce(args)
     entries = None
     if args.baseline:
@@ -325,9 +411,10 @@ def cmd_check(args) -> int:
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
                                   diag=diag)
+    violations = _settle_exceptions(args, loaded, violations, diag)
     if entries is not None:
         violations = engine_mod.not_baselined(violations, entries)
-    _print_violations(violations, args.format, len(loaded.adrs))
+    _print_violations(violations, args.format, len(loaded.adrs), loaded.rules)
     return _verdict(args, violations, diag)
 
 
@@ -372,6 +459,8 @@ def cmd_baseline(args) -> int:
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
                                   diag=diag)
+    violations = engine_mod.apply_exceptions(violations,
+                                             datetime.date.today())[0]
     out = (args.output if os.path.isabs(args.output)
            else os.path.join(root, args.output))
     with open(out, "w", encoding="utf-8") as f:
@@ -410,7 +499,9 @@ def cmd_drift(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _verbose_notes(args, loaded)
     if not all_rules:
+        _retired_hint(args, loaded)
         return _nothing_to_enforce(args)
 
     # Compare commits: the base ref against HEAD. Both sides are read out of
@@ -426,7 +517,10 @@ def cmd_drift(args) -> int:
     except githelp.GitError as e:
         return _git_failed(e)
     if not changed:
-        if args.format == "json":
+        if args.format == "sarif":
+            print(json.dumps(sarif_mod.build([], all_rules, VERSION),
+                             indent=2))
+        elif args.format == "json":
             print("[]")
         else:
             print(f"no source files changed since {args.since} "
@@ -460,10 +554,15 @@ def cmd_drift(args) -> int:
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
 
+    new_violations = _settle_exceptions(args, loaded, new_violations, diag,
+                                        complete=False)
     if args.format == "json":
         # Stable contract: the JSON list is the NEW violations, as before.
         # Fixed violations are reported in the human output.
-        print(json.dumps([v.as_dict() for v in new_violations], indent=2))
+        print(json.dumps([v.report_dict() for v in new_violations], indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(sarif_mod.build(new_violations, loaded.rules,
+                                         VERSION), indent=2))
     else:
         if not new_violations:
             print(f"{sym('✓')} no new drift since {args.since} "
@@ -477,7 +576,7 @@ def cmd_drift(args) -> int:
                     root, v.file, v.line or 1)
                 tag = f" [{commit}]" if commit else ""
                 print(f"  {v.file}:{v.line or sym('—')}{tag}: {v.detail}")
-                print(f"      rule: {v.rule.describe()} ({v.rule.source})")
+                _print_rule_lines(v, indent="      ")
         if fixed_violations:
             print(f"\n{sym('✓')} {len(fixed_violations)} fixed since "
                   f"{args.since}:\n")
@@ -587,6 +686,18 @@ def _adr_dir_arg(value: str) -> str:
     return value
 
 
+def _add_report_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--verbose", action="store_true",
+                        help="Also say, on stderr, which ADRs are not "
+                             "enforced (superseded or deprecated) and which "
+                             "temporary exceptions are letting violations "
+                             "through.")
+    parser.add_argument("--today", type=_date_arg, default=None,
+                        metavar="YYYY-MM-DD",
+                        help="Treat this as today's date when judging "
+                             "'allow-until' exceptions (reproducible runs).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="adr-drift",
@@ -610,7 +721,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("check", parents=where,
                        help="Verify the repo against all rules.")
-    c.add_argument("--format", choices=["human", "json"], default="human")
+    c.add_argument("--format", choices=["human", "json", "sarif"],
+                   default="human",
+                   help="human text (default), a JSON list, or a SARIF 2.1.0 "
+                        "log for code-scanning tools.")
+    _add_report_options(c)
     c.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     c.add_argument("--strict-py-only", action="store_true",
@@ -640,7 +755,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="New violations since a git ref.")
     d.add_argument("--since", default="HEAD~5",
                    help="Git ref to compare against (default: HEAD~5).")
-    d.add_argument("--format", choices=["human", "json"], default="human")
+    d.add_argument("--format", choices=["human", "json", "sarif"],
+                   default="human",
+                   help="human text (default), a JSON list of the new "
+                        "violations, or a SARIF 2.1.0 log of them.")
+    _add_report_options(d)
     d.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     d.add_argument("--allow-empty", action="store_true",

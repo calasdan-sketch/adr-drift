@@ -40,7 +40,7 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 | Command | What it does |
 |---|---|
 | `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index (a `README.md` of yours is kept) |
-| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules) |
+| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules; `--format human\|json\|sarif`; `--verbose` explains what is not enforced) |
 | `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` |
 | `drift --since HEAD~5` | Report violations *introduced* between a git ref and `HEAD`, plus violations *fixed* in that range (pre-existing ones ignored) |
 | `new "title"` | Create the next-numbered ADR from a template |
@@ -74,6 +74,34 @@ spells the import: a `db` layer mapped to `src/myapp/db/**` is reached by
 and, in a flat layout, `import db.conn` - a rule naming the layer (`db`) or
 any of those spellings matches all of them. Only the layer's leading
 directories are stripped, never its own, so `conn` alone matches nothing.
+
+### Temporary exceptions: `allow-until`
+
+A migration takes time. End a rule with `allow-until: YYYY-MM-DD` and its
+violations are allowed up to and including that day:
+
+```
+forbid-import: handlers -> db.drivers  allow-until: 2026-12-31   # migrating, see ticket 123
+```
+
+From the next day the violations fail again, with a message that says the
+exception ended and when. A run prints one `note:` line on stderr whenever an
+exception lets violations through (`--verbose` lists them), and a warning
+for an exception that has ended: either its violations now fail, or there are
+none left and the `allow-until` can be deleted (`--strict` makes that
+warning an error). A date that is not a real `YYYY-MM-DD` is an error, not a
+rule that never ends. In `arch.yaml` quote the line (`"forbid-import: a -> b
+allow-until: 2026-12-31"`). `--today YYYY-MM-DD` pretends it is another day
+(handy for testing a deadline). A `forbid-pattern` whose regex itself ends in
+`allow-until:` must be written another way (for example `allow-until[:]`).
+
+### Superseded and deprecated ADRs
+
+An ADR whose status says `Superseded` (for example `Superseded by ADR-0007`)
+or `Deprecated` stops enforcing its constraints, and its Constraints section
+is not even parsed. `check --verbose` lists such ADRs. `Accepted (supersedes
+ADR-0002)` is not retired: only a status that *starts* with one of the two
+words counts.
 
 ### Where the ADRs are
 
@@ -237,6 +265,34 @@ are*). Pattern rules apply to the scanned source files only
 (`.py .js .jsx .ts .tsx .mjs .cjs .go .rs .java .rb .php`). `--strict` turns
 any warning into exit 2.
 
+### Reports: text, JSON and SARIF
+
+Every violation says how to fix it and which ADR it comes from. In text
+output, under each violation:
+
+```
+src/util.py:2: matches /\beval\(/
+  rule: src/**.py must not contain /\beval\(/ (docs/adr/0002-no-dynamic-eval.md)
+  ADR 0002: No dynamic eval (docs/adr/0002-no-dynamic-eval.md)
+  fix: Remove or rewrite the code at src/util.py:2 that matches /\beval\(/. ...
+```
+
+In `--format json` each violation has the old keys (`rule`, `rule_source`,
+`file`, `line`, `detail`) plus `fix_hint` and `adr` (`{"number": 2, "title":
+"No dynamic eval", "path": "docs/adr/0002-no-dynamic-eval.md"}`, or `null` for
+a rule in `arch.yaml`); a violation of an expired exception also has
+`exception_expired`.
+
+`--format sarif` (on `check` and `drift`) writes a SARIF 2.1.0 log, the format
+GitHub code scanning reads. Paths are relative to `--root`, so run it from
+the repository root for GitHub:
+
+```yaml
+- run: adr-drift check --format sarif --fail-on none > adr-drift.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: {sarif_file: adr-drift.sarif}
+```
+
 ## CI
 
 ```yaml
@@ -266,6 +322,43 @@ exits 2 (nothing is enforced) unless you pass `--allow-empty` (in the action:
 so give it `fetch-depth: 0` (otherwise `drift` exits 2 and says so). For a
 pull request compare against where the branch left the base:
 `adr-drift drift --since "$(git merge-base origin/main HEAD)"`.
+
+### pre-commit
+
+```yaml
+repos:
+  - repo: https://github.com/calasdan-sketch/adr-drift
+    rev: v0.2.0
+    hooks:
+      - id: adr-drift
+```
+
+The hook runs `adr-drift check` on the whole repository (rules are about the
+architecture, not about one file). Add `args: [--adr-dir, doc/adr]` to pass
+options.
+
+### Telling Claude Code when it breaks a rule
+
+A `PostToolUse` hook runs after every edit; exit code 2 hands the message
+back to Claude so it can fix the code. In `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "adr-drift check >&2 || exit 2"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+`adr-drift check` exits 1 for violations, which a hook only shows to you;
+`>&2 || exit 2` moves the report to stderr and turns any failure into 2.
 
 ## Limitations
 

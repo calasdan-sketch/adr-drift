@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+- `--format sarif` on `check` and `drift`: a SARIF 2.1.0 log for GitHub code
+  scanning and other viewers.
+- Every violation says how to fix it and where the rule came from. Text
+  output prints the ADR number and title and a `fix:` line; JSON gets
+  `fix_hint` and `adr` (`{number, title, path}`, `null` for `arch.yaml`) next
+  to the old keys.
+- A `Superseded` or `Deprecated` ADR stops enforcing its constraints
+  (`--verbose` says which). A status that only mentions superseding, like
+  `Accepted (supersedes ADR-0002)`, still counts.
+- Temporary exceptions: end a rule with `allow-until: YYYY-MM-DD`. Its
+  violations are allowed through that day, then fail with a message that says
+  the exception ended. An exception that has ended is warned about, also when
+  it is no longer needed. `--today` sets the date for testing.
+- `.pre-commit-hooks.yaml` (hook id `adr-drift`) and a README snippet for a
+  Claude Code `PostToolUse` hook.
+- `--verbose` on `check` and `drift`.
+- Not built: a "new dependency needs an ADR" nudge. Telling a new dependency
+  from a moved or renamed one means reading every ecosystem's manifest and
+  lock files, and a guess there would produce false alarms.
+
 ## 0.1.4
 
 - A report that cannot be written (`> /dev/full`, a full disk) now really
