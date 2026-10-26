@@ -256,9 +256,45 @@ def read_regular(path: str, limit: int, root: "str | None" = None) -> bytes:
     return data
 
 
-def iter_source_files(root: str) -> list[str]:
-    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                 "dist", "build", ".tox", "vendor"}
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+              "dist", "build", ".tox", "vendor"}
+
+
+def _listed_by_git(root: str) -> "list[str] | None":
+    """Tracked files plus untracked ones that .gitignore does not hide, as
+    absolute paths; None when `root` is not the top of a git work tree or git
+    cannot be run (the caller then walks the folder)."""
+    from . import githelp
+    try:
+        if not githelp.is_repo(root):
+            return None
+        raw = githelp._run(root, "ls-files", "-z", "--cached", "--others",
+                           "--exclude-standard")
+    except Exception:
+        return None
+    out = []
+    for name in raw.decode("utf-8", "surrogateescape").split("\0"):
+        if not name:
+            continue
+        parts = name.split("/")
+        if any(p in _SKIP_DIRS for p in parts[:-1]):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        path = os.path.join(root, *parts)
+        if (ext in PY_EXTS or ext in GENERIC_EXTS) and os.path.lexists(path):
+            out.append(path)
+    return sorted(set(out))
+
+
+def iter_source_files(root: str, use_git: bool = True) -> list[str]:
+    """The source files to check. In a git work tree: what git lists (so
+    .gitignore is honoured and generated folders never need naming); else a
+    walk that skips the usual build and dependency folders."""
+    if use_git:
+        listed = _listed_by_git(root)
+        if listed is not None:
+            return listed
+    skip_dirs = _SKIP_DIRS
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]

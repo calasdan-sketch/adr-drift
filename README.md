@@ -4,6 +4,8 @@ Deterministic architecture tests for any language. ADRs rot the moment they
 merge — this keeps them mechanically true. Define layers and constraints once,
 then `adr-drift check` fails CI when code drifts from the decisions.
 
+**Limits:** It checks the rules you wrote in `arch.yaml` by reading imports and text; it does not run your code, and a rule you did not write is not checked.
+
 ## The problem
 
 > "The moment an ADR gets merged, it decays into a passive historical record
@@ -388,6 +390,42 @@ back to Claude so it can fix the code. In `.claude/settings.json`:
   `[ok]`/`[x]`.
 - Rules are only as good as the constraints you write - `init` scaffolds
   layers from the folder layout and writes no rule for you.
+
+## Scan scope, time limits and CI trust
+
+**What is scanned.** In a git work tree adr-drift scans the files git lists
+(tracked files plus untracked ones that `.gitignore` does not hide), so
+generated and ignored folders need no naming; elsewhere it walks the folder and
+skips `node_modules`, `.venv`, `dist`, `build` and the like. `arch.yaml` can
+narrow this further with globs:
+
+```yaml
+exclude: ["src/generated/**", "**/*_pb2.py"]   # never scanned
+include: ["src/**"]                            # optional: scan only these
+```
+
+**Pattern rules cannot hang the check.** `forbid-pattern` / `require-pattern`
+run Python regular expressions, and a regex such as `(a+)+$` takes exponential
+time. A pull request can edit the rules, so: a pattern with a repeat inside a
+repeat (or a repeated alternation whose branches start alike) is refused when
+the rule loads (exit 2, with the pattern named); every pattern rule runs under
+a deadline (`--rule-timeout`, default 10 s) and the whole evaluation under
+`--timeout` (default 300 s). On Linux and macOS the timer interrupts the
+matcher and the run exits 2 with the rule named; on Windows a watchdog ends the
+process with the same message. The screen is a heuristic, not a proof: a
+pattern it lets through is still bounded by the deadline.
+
+**Read the rules from the base branch in CI.** `check` runs whatever
+`arch.yaml` and ADRs are in the checkout, so a pull request that edits them
+can weaken or delete the rule it breaks. For a gate that means something, check
+out the base branch's `arch.yaml` and `docs/adr/` (for example
+`git checkout origin/main -- arch.yaml docs/adr`) before running `check`, and
+review changes to those files like changes to the CI configuration.
+
+**Reports.** `--format markdown` (on `check` and `drift`) prints a pull-request
+comment: one row per violation with the rule, the ADR it comes from and how to
+fix it. `adr-drift report --html trend.html --since HEAD~20` writes a single
+static page (no script) with the violations each commit added and fixed.
 
 ## Trusted rules
 

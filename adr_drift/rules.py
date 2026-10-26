@@ -18,6 +18,8 @@ import difflib
 import fnmatch
 import re
 
+from . import redos as redos_mod
+
 #: The rule names the DSL knows.
 KINDS = ("forbid-import", "forbid-pattern", "require-pattern")
 
@@ -109,6 +111,13 @@ def parse_rule_line(line: str, source: str = "",
             re.compile(rule.regex)  # validate early
         except re.error as e:
             raise ValueError(f"bad {kind} regex in {line.strip()!r}: {e}")
+        slow = redos_mod.problem(rule.regex)
+        if slow:
+            raise ValueError(
+                f"{kind} regex in {line.strip()!r} can take exponential time "
+                f"({slow}); a pull request could use it to hang the check. "
+                "Rewrite it without a repeat inside a repeat, for example "
+                r"'(\w+\s?)*' as '[\w\s]*'")
     return rule
 
 

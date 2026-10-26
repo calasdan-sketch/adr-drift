@@ -37,7 +37,7 @@ _H2_RE = re.compile(r"^##\s")
 # long run of blanks that is tried at every position, which is quadratic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
-ARCH_KEYS = ("layers", "rules")
+ARCH_KEYS = ("layers", "rules", "exclude", "include")
 LAYER_KEYS = ("name", "paths")
 #: A key with this prefix is a note, at the top level and in a layer.
 NOTE_KEY_PREFIX = "x-"
@@ -58,6 +58,8 @@ class Loaded:
     adrs: list
     warnings: list
     notes: list = dataclasses.field(default_factory=list)  # for --verbose
+    exclude: list = dataclasses.field(default_factory=list)   # arch.yaml `exclude:`
+    include: list = dataclasses.field(default_factory=list)   # arch.yaml `include:`
 
 
 def _lines(text: str) -> "list[str]":
@@ -125,7 +127,21 @@ def _rule_item_lines(lines) -> "list[int]":
     return out
 
 
-def load_arch_yaml(root: str, problems: "list[str] | None" = None
+def _globs(raw, key: str, problems) -> "list[str]":
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not all(isinstance(g, str) and g.strip()
+                                            for g in raw):
+        problems.append(f"{ARCH_FILE}: '{key}' must be a list of glob "
+                        "patterns such as 'src/generated/**'")
+        return []
+    return [g.strip() for g in raw]
+
+
+def load_arch_yaml(root: str, problems: "list[str] | None" = None,
+                   filters: "dict | None" = None
                    ) -> "tuple[list[dict], list[rules_mod.Rule]]":
     """Returns (layers, rules). Missing arch.yaml -> ([], []).
 
@@ -173,6 +189,9 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
             f"'{NOTE_KEY_PREFIX}' to keep it)")
     layers = _load_layers(data.get("layers"), lines, problems)
     out = _load_rules(data.get("rules"), lines, problems)
+    if filters is not None:
+        filters["exclude"] = _globs(data.get("exclude"), "exclude", problems)
+        filters["include"] = _globs(data.get("include"), "include", problems)
     if own and problems:
         raise ConfigError(problems)
     return layers, out
@@ -594,7 +613,8 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     `adr_dir` is None (look in the usual places), one directory or a list of
     them; see find_adrs()."""
     problems: "list[str]" = []
-    layers, arch_rules = load_arch_yaml(root, problems)
+    filters: dict = {}
+    layers, arch_rules = load_arch_yaml(root, problems, filters)
     adrs: "list[dict]" = []
     search = find_adrs(root, adr_dir)
     warnings: "list[str]" = list(search.warnings)
@@ -619,7 +639,8 @@ def load_all(root: str, adr_dir=None) -> Loaded:
             notes.append(
                 f"{shown}: status '{a['status']}': this ADR is {a['retired']}"
                 ", so its Constraints are not enforced")
-    return Loaded(layers, all_rules, adrs, warnings, notes)
+    return Loaded(layers, all_rules, adrs, warnings, notes,
+                  filters.get("exclude", []), filters.get("include", []))
 
 
 def load_all_rules(root: str, adr_dir=None

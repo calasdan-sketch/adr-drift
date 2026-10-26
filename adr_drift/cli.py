@@ -28,6 +28,7 @@ from . import diag as diag_mod
 from . import engine as engine_mod
 from . import githelp
 from . import langs as langs_mod
+from . import report as report_mod
 from . import rules as rules_mod
 from . import sarif as sarif_mod
 from . import scanner as scanner_mod
@@ -297,6 +298,9 @@ def _print_violations(violations, fmt: str, adr_count: int,
         print(json.dumps(sarif_mod.build(violations, rules, VERSION),
                          indent=2))
         return
+    if fmt == "markdown":
+        print(report_mod.markdown(violations, "adr-drift", adr_count), end="")
+        return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
         verdict = ("all ADRs hold (%d read)" % adr_count if adr_count
@@ -410,7 +414,8 @@ def cmd_check(args) -> int:
             return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
+                                  diag=diag, exclude=loaded.exclude,
+                                  include=loaded.include)
     violations = _settle_exceptions(args, loaded, violations, diag)
     if entries is not None:
         violations = engine_mod.not_baselined(violations, entries)
@@ -458,7 +463,8 @@ def cmd_baseline(args) -> int:
         return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
+                                  diag=diag, exclude=loaded.exclude,
+                                  include=loaded.include)
     violations = engine_mod.apply_exceptions(violations,
                                              datetime.date.today())[0]
     out = (args.output if os.path.isabs(args.output)
@@ -486,47 +492,10 @@ def _git_failed(e: "githelp.GitError") -> int:
     return 2
 
 
-def cmd_drift(args) -> int:
-    root = args.root
-    try:
-        githelp.require_repo(root)
-    except githelp.GitError as e:
-        return _git_failed(e)
-    loaded = _load_or_report(root, args.adr_dir)
-    if loaded is None:
-        return 2
+def _compare(root, loaded, changed, blobs, diag):
+    """(new, fixed) violations between the two sides of `changed` (a list of
+    githelp.Change with their blobs read)."""
     layers, all_rules = loaded.layers, loaded.rules
-    diag = diag_mod.Diagnostics()
-    for message in loaded.warnings:
-        diag.warn(message)
-    _verbose_notes(args, loaded)
-    if not all_rules:
-        _retired_hint(args, loaded)
-        return _nothing_to_enforce(args)
-
-    # Compare commits: the base ref against HEAD. Both sides are read out of
-    # git, so the working tree (uncommitted edits) never matters, and a
-    # non-ASCII name is whatever git says it is.
-    try:
-        githelp.head_commit(root)
-        base = githelp.resolve_commit(root, args.since)
-        changed = [c for c in githelp.changes(root, base)
-                   if _is_source(c.path) or _is_source(c.old_path)]
-        blobs = githelp.read_blobs(
-            root, [b for c in changed for b in (c.old_blob, c.new_blob)])
-    except githelp.GitError as e:
-        return _git_failed(e)
-    if not changed:
-        if args.format == "sarif":
-            print(json.dumps(sarif_mod.build([], all_rules, VERSION),
-                             indent=2))
-        elif args.format == "json":
-            print("[]")
-        else:
-            print(f"no source files changed since {args.since} "
-                  f"{sym('—')} no drift")
-        return _verdict(args, [], diag)
-
     quiet = diag_mod.Diagnostics(echo=False)  # the base side: warn once
     go_module = langs_mod.go_module_path(root)
 
@@ -553,6 +522,58 @@ def cmd_drift(args) -> int:
         engine_mod.evaluate(now_entries, layers, all_rules), renames)
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
+    return new_violations, fixed_violations
+
+
+def cmd_drift(args) -> int:
+    root = args.root
+    try:
+        githelp.require_repo(root)
+    except githelp.GitError as e:
+        return _git_failed(e)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
+        return 2
+    layers, all_rules = loaded.layers, loaded.rules
+    diag = diag_mod.Diagnostics()
+    for message in loaded.warnings:
+        diag.warn(message)
+    _verbose_notes(args, loaded)
+    if not all_rules:
+        _retired_hint(args, loaded)
+        return _nothing_to_enforce(args)
+
+    # Compare commits: the base ref against HEAD. Both sides are read out of
+    # git, so the working tree (uncommitted edits) never matters, and a
+    # non-ASCII name is whatever git says it is.
+    try:
+        githelp.head_commit(root)
+        base = githelp.resolve_commit(root, args.since)
+        changed = [c for c in githelp.changes(root, base)
+                   if (_is_source(c.path) or _is_source(c.old_path))
+                   and (engine_mod.selected(c.path, loaded.exclude, loaded.include)
+                        or (c.old_path and engine_mod.selected(
+                            c.old_path, loaded.exclude, loaded.include)))]
+        blobs = githelp.read_blobs(
+            root, [b for c in changed for b in (c.old_blob, c.new_blob)])
+    except githelp.GitError as e:
+        return _git_failed(e)
+    if not changed:
+        if args.format == "sarif":
+            print(json.dumps(sarif_mod.build([], all_rules, VERSION),
+                             indent=2))
+        elif args.format == "json":
+            print("[]")
+        elif args.format == "markdown":
+            print(report_mod.markdown([], f"adr-drift: new since {args.since}",
+                                      len(loaded.adrs)), end="")
+        else:
+            print(f"no source files changed since {args.since} "
+                  f"{sym('—')} no drift")
+        return _verdict(args, [], diag)
+
+    new_violations, fixed_violations = _compare(
+        root, loaded, changed, blobs, diag)
 
     new_violations = _settle_exceptions(args, loaded, new_violations, diag,
                                         complete=False)
@@ -563,6 +584,10 @@ def cmd_drift(args) -> int:
     elif args.format == "sarif":
         print(json.dumps(sarif_mod.build(new_violations, loaded.rules,
                                          VERSION), indent=2))
+    elif args.format == "markdown":
+        print(report_mod.markdown(new_violations,
+                                  f"adr-drift: new since {args.since}",
+                                  len(loaded.adrs), fixed_violations), end="")
     else:
         if not new_violations:
             print(f"{sym('✓')} no new drift since {args.since} "
@@ -584,6 +609,47 @@ def cmd_drift(args) -> int:
                 print(f"  {v.file}:{v.line or sym('—')}: {v.detail} (fixed)")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
     return _verdict(args, new_violations, diag)
+
+
+def cmd_report(args) -> int:
+    """The drift trend page: for each commit after --since, the violations it
+    added and fixed (the same comparison `drift` makes), as one HTML file."""
+    root = args.root
+    try:
+        githelp.require_repo(root)
+        base = githelp.resolve_commit(root, args.since)
+        githelp.head_commit(root)
+        commits = githelp.commits_since(root, base, max(1, args.max_commits))
+    except githelp.GitError as e:
+        return _git_failed(e)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
+        return 2
+    if not loaded.rules:
+        return _nothing_to_enforce(args)
+    diag = diag_mod.Diagnostics(echo=False)
+    points, per_rule = [], {}
+    prev = base
+    try:
+        for sha, subject in commits:
+            changed = [c for c in githelp.changes(root, prev, sha)
+                       if (_is_source(c.path) or _is_source(c.old_path))
+                       and engine_mod.selected(c.path, loaded.exclude, loaded.include)]
+            blobs = githelp.read_blobs(
+                root, [b for c in changed for b in (c.old_blob, c.new_blob)])
+            new, fixed = _compare(root, loaded, changed, blobs, diag)
+            for v in new:
+                per_rule[v.rule.describe()] = per_rule.get(v.rule.describe(), 0) + 1
+            points.append({"commit": sha, "subject": subject,
+                           "new": len(new), "fixed": len(fixed)})
+            prev = sha
+    except githelp.GitError as e:
+        return _git_failed(e)
+    page = report_mod.html_page(points, args.since, per_rule)
+    with open(args.html, "w", encoding="utf-8", newline="\n") as f:
+        f.write(page)
+    print(f"wrote {args.html} ({len(points)} commit(s))")
+    return 0
 
 
 def cmd_new(args) -> int:
@@ -686,6 +752,27 @@ def _adr_dir_arg(value: str) -> str:
     return value
 
 
+def _positive(value: str) -> float:
+    try:
+        x = float(value)
+    except ValueError:
+        x = 0.0
+    if not x > 0:
+        raise argparse.ArgumentTypeError(f"{value!r}: want a number of seconds above 0")
+    return x
+
+
+def _add_limit_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--timeout", type=_positive, default=None, metavar="SECONDS",
+                        help="Stop (exit 2) if evaluating all rules takes longer "
+                             "than this (default: 300).")
+    parser.add_argument("--rule-timeout", type=_positive, default=None, metavar="SECONDS",
+                        help="Stop (exit 2) if one pattern rule takes longer than "
+                             "this (default: 10). A catastrophic regex is "
+                             "refused when the rule loads; this is the second "
+                             "line of defence.")
+
+
 def _add_report_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true",
                         help="Also say, on stderr, which ADRs are not "
@@ -721,11 +808,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("check", parents=where,
                        help="Verify the repo against all rules.")
-    c.add_argument("--format", choices=["human", "json", "sarif"],
+    c.add_argument("--format", choices=["human", "json", "sarif", "markdown"],
                    default="human",
-                   help="human text (default), a JSON list, or a SARIF 2.1.0 "
-                        "log for code-scanning tools.")
+                   help="human text (default), a JSON list, a SARIF 2.1.0 "
+                        "log for code-scanning tools, or markdown for a pull "
+                        "request comment.")
     _add_report_options(c)
+    _add_limit_options(c)
     c.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     c.add_argument("--strict-py-only", action="store_true",
@@ -747,6 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: .adr-baseline.json under --root).")
     b.add_argument("--strict-py-only", action="store_true",
                    help="Skip the regex fallback for non-Python files.")
+    _add_limit_options(b)
     b.add_argument("--allow-empty", action="store_true",
                    help="Write an empty baseline when there are no rules "
                         "(default: exit 2).")
@@ -755,11 +845,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="New violations since a git ref.")
     d.add_argument("--since", default="HEAD~5",
                    help="Git ref to compare against (default: HEAD~5).")
-    d.add_argument("--format", choices=["human", "json", "sarif"],
+    d.add_argument("--format", choices=["human", "json", "sarif", "markdown"],
                    default="human",
                    help="human text (default), a JSON list of the new "
                         "violations, or a SARIF 2.1.0 log of them.")
     _add_report_options(d)
+    _add_limit_options(d)
     d.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     d.add_argument("--allow-empty", action="store_true",
@@ -767,6 +858,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "exit 2, because nothing would be enforced).")
     d.add_argument("--strict", action="store_true",
                    help="Treat warnings as errors: exit 2.")
+
+    r = sub.add_parser("report", parents=where,
+                       help="Write an HTML page: violations added and fixed, "
+                            "commit by commit, since a git ref.")
+    r.add_argument("--html", required=True, metavar="FILE",
+                   help="Where to write the page.")
+    r.add_argument("--since", default="HEAD~20",
+                   help="Git ref to start from (default: HEAD~20).")
+    r.add_argument("--max-commits", type=int, default=30, metavar="N",
+                   help="At most the newest N commits (default: 30).")
+    _add_limit_options(r)
 
     n = sub.add_parser("new", parents=where,
                        help="Create the next-numbered ADR.")
@@ -950,9 +1052,17 @@ def _main(argv) -> int:
     if root is not None and not os.path.isdir(root):
         print(f"error: --root: not a directory: {root}", file=sys.stderr)
         return 2
-    return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
-            "drift": cmd_drift, "new": cmd_new,
-            "index": cmd_index}[args.cmd](args)
+    if getattr(args, "timeout", None):
+        engine_mod.LIMITS["total"] = args.timeout
+    if getattr(args, "rule_timeout", None):
+        engine_mod.LIMITS["rule"] = args.rule_timeout
+    try:
+        return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
+                "drift": cmd_drift, "new": cmd_new, "index": cmd_index,
+                "report": cmd_report}[args.cmd](args)
+    except engine_mod.RuleTimeout as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

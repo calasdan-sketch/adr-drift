@@ -34,3 +34,6 @@ adr-drift = "adr_drift.cli:main"
 
 [tool.setuptools]
 packages = ["adr_drift"]
+
+[tool.setuptools.package-data]
+adr_drift = ["py.typed"]

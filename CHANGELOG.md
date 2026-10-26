@@ -2,6 +2,19 @@
 
 ## 0.2.0
 
+- **Pattern rules cannot hang a check.** A regex with a repeat inside a repeat
+  (`(a+)+$`, `(\w+\s?)*`) or a repeated alternation with overlapping branches
+  is refused when the rule loads; every pattern rule also runs under a
+  deadline (`--rule-timeout`, default 10 s) and the whole evaluation under
+  `--timeout` (default 300 s), exit 2 with the rule named.
+- `arch.yaml` takes `exclude:` and `include:` globs; in a git work tree the
+  files git lists are scanned (`.gitignore` honoured). CI guidance: read the
+  rules from the base branch.
+- `--format markdown` on `check` and `drift` (pull-request comment with rule,
+  ADR and fix), and `adr-drift report --html FILE --since REF` (a static trend
+  page of violations added and fixed per commit).
+- Each file is split into lines once, not once per rule.
+- SECURITY.md, `__version__` test, `py.typed`, release tests before publish.
 - Tests only: the /dev/zero tests no longer fail where the system refuses the memory cap (macOS raises ValueError for a limit above its hard maximum).
 
 - `--format sarif` on `check` and `drift`: a SARIF 2.1.0 log for GitHub code
