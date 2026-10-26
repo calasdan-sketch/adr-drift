@@ -114,8 +114,12 @@ class TestConfigFilesAreGuarded(unittest.TestCase):
     def _limited(self, root, *argv):
         """Run the CLI with the address space capped, so the old unbounded
         read fails fast instead of eating the machine."""
+        # macOS refuses a limit above its hard maximum (ValueError) and does not
+        # enforce RLIMIT_AS at all; the code under test bounds its reads anyway,
+        # the cap only makes an old unbounded read fail fast where it works.
         code = ("import resource,sys;"
-                "resource.setrlimit(resource.RLIMIT_AS,(2<<30,2<<30));"
+                "exec('try:\\n resource.setrlimit(resource.RLIMIT_AS,(2<<30,2<<30))"
+                "\\nexcept (ValueError, OSError):\\n pass');"
                 "from adr_drift.cli import main;"
                 "sys.exit(main(sys.argv[1:]))")
         if os.name == "nt":

@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Tests only: the /dev/zero tests no longer fail where the system refuses the memory cap (macOS raises ValueError for a limit above its hard maximum).
+
 - `--format sarif` on `check` and `drift`: a SARIF 2.1.0 log for GitHub code
   scanning and other viewers.
 - Every violation says how to fix it and where the rule came from. Text
