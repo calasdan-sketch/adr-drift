@@ -1,0 +1,9 @@
+# Hooks that other repositories can use with https://pre-commit.com
+# (see "pre-commit" in the README).
+- id: adr-drift
+  name: adr-drift (architecture rules)
+  description: Check the code against the rules in arch.yaml and in the ADRs' Constraints sections.
+  entry: adr-drift check
+  language: python
+  pass_filenames: false
+  always_run: true

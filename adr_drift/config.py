@@ -15,6 +15,7 @@ import re
 
 from . import miniyaml
 from . import rules as rules_mod
+from . import scanner as scanner_mod
 
 #: Where ADRs are looked for when --adr-dir is not given: the first of these
 #: directories that exists is read (adr-tools writes doc/adr, MADR
@@ -36,7 +37,7 @@ _H2_RE = re.compile(r"^##\s")
 # long run of blanks that is tried at every position, which is quadratic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
-ARCH_KEYS = ("layers", "rules")
+ARCH_KEYS = ("layers", "rules", "exclude", "include")
 LAYER_KEYS = ("name", "paths")
 #: A key with this prefix is a note, at the top level and in a layer.
 NOTE_KEY_PREFIX = "x-"
@@ -56,6 +57,9 @@ class Loaded:
     rules: list
     adrs: list
     warnings: list
+    notes: list = dataclasses.field(default_factory=list)  # for --verbose
+    exclude: list = dataclasses.field(default_factory=list)   # arch.yaml `exclude:`
+    include: list = dataclasses.field(default_factory=list)   # arch.yaml `include:`
 
 
 def _lines(text: str) -> "list[str]":
@@ -123,7 +127,21 @@ def _rule_item_lines(lines) -> "list[int]":
     return out
 
 
-def load_arch_yaml(root: str, problems: "list[str] | None" = None
+def _globs(raw, key: str, problems) -> "list[str]":
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not all(isinstance(g, str) and g.strip()
+                                            for g in raw):
+        problems.append(f"{ARCH_FILE}: '{key}' must be a list of glob "
+                        "patterns such as 'src/generated/**'")
+        return []
+    return [g.strip() for g in raw]
+
+
+def load_arch_yaml(root: str, problems: "list[str] | None" = None,
+                   filters: "dict | None" = None
                    ) -> "tuple[list[dict], list[rules_mod.Rule]]":
     """Returns (layers, rules). Missing arch.yaml -> ([], []).
 
@@ -131,15 +149,20 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
     then problems are appended to it and whatever did parse is returned.
     """
     path = os.path.join(root, ARCH_FILE)
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):  # a link to /dev/zero is not "missing"
         return [], []
     own = problems is None
     problems = [] if own else problems
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            text = f.read()
+        data = scanner_mod.read_regular(path, scanner_mod.MAX_CONFIG_BYTES,
+                                        root=root)
+        text = data.decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
-        problems.append(f"{ARCH_FILE}: cannot read ({e})")
+        problems.append(f"{ARCH_FILE}: cannot read "
+                        f"({getattr(e, 'strerror', None) or e})")
+        text = ""
+    except MemoryError:
+        problems.append(f"{ARCH_FILE}: cannot read (out of memory)")
         text = ""
     lines = _lines(text)
     data = None
@@ -166,6 +189,9 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
             f"'{NOTE_KEY_PREFIX}' to keep it)")
     layers = _load_layers(data.get("layers"), lines, problems)
     out = _load_rules(data.get("rules"), lines, problems)
+    if filters is not None:
+        filters["exclude"] = _globs(data.get("exclude"), "exclude", problems)
+        filters["include"] = _globs(data.get("include"), "include", problems)
     if own and problems:
         raise ConfigError(problems)
     return layers, out
@@ -477,8 +503,35 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
     return title, status or _status_line(body)
 
 
+#: A status that retires the ADR: "Superseded by ADR-0007", "Deprecated".
+#: Anchored at the start, so "Accepted (supersedes ADR-0002)" still counts.
+_RETIRED_RE = re.compile(r"[\W_]*(superseded|deprecated)\b", re.IGNORECASE)
+_TITLE_NUMBER_RE = re.compile(
+    r"(?:adr[ -]*)?\d+(?:[ \t]*[:.)]|[ \t]+[-\u2013\u2014])[ \t]*",
+    re.IGNORECASE)
+
+
+def retired_status(status: str) -> str:
+    """"superseded" or "deprecated" when the ADR's status says it no longer
+    holds, else ""."""
+    m = _RETIRED_RE.match(status or "")
+    return m.group(1).lower() if m else ""
+
+
+def _adr_number(path: str, lines: "list[str]") -> "int | None":
+    m = re.match(r"(\d+)[-_]", os.path.basename(path))
+    if m:
+        return int(m.group(1))
+    for line in lines:
+        h = _TITLE_RE.match(line)
+        if h:
+            n = re.match(r"(?:adr[ -]*)?(\d+)\b", h.group(1), re.IGNORECASE)
+            return int(n.group(1)) if n else None
+    return None
+
+
 def parse_adr(path: str, display: "str | None" = None,
-              parse_rules: bool = True) -> dict:
+              parse_rules: bool = True, root: "str | None" = None) -> dict:
     """Extract number, title, status, and constraint rules from an ADR.
 
     `display` is how the file is named in messages and rule sources (the
@@ -487,8 +540,14 @@ def parse_adr(path: str, display: "str | None" = None,
     Raises ConfigError (a ValueError) listing every bad constraint line.
     """
     shown = display or path
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        text = f.read()
+    # Only a regular file of a sane size is read: an ADR directory can hold
+    # a link to /dev/zero. RefusedFile is an OSError, MemoryError becomes one.
+    try:
+        data = scanner_mod.read_regular(path, scanner_mod.MAX_CONFIG_BYTES,
+                                        root=root)
+    except MemoryError:
+        raise scanner_mod.RefusedFile("out of memory") from None
+    text = data.decode("utf-8-sig", "replace")
     info: dict = {"path": path, "number": "", "title": "",
                   "status": "", "rules": [], "warnings": []}
     m = re.match(r"(\d+)[-_](.+)\.md$", os.path.basename(path))
@@ -499,7 +558,17 @@ def parse_adr(path: str, display: "str | None" = None,
     title, status = adr_title_and_status(lines)
     info["title"] = title or info["title"]
     info["status"] = status
+    info["retired"] = retired_status(status)
+    clean = _TITLE_NUMBER_RE.match(info["title"])
+    info["adr"] = {"number": _adr_number(path, lines),
+                   "title": (info["title"][clean.end():] if clean
+                             else info["title"]) or info["title"],
+                   "path": shown.replace(os.sep, "/")}
     if not parse_rules:
+        return info
+    if info["retired"]:
+        # A superseded or deprecated decision no longer constrains anyone:
+        # its Constraints are not read (so a stale line cannot break a run).
         return info
     problems: "list[str]" = []
     in_section = False
@@ -525,6 +594,7 @@ def parse_adr(path: str, display: "str | None" = None,
             problems.append(f"{_where(shown, number)}: {e}")
             continue
         if rule is not None:
+            rule.adr = info["adr"]
             info["rules"].append(rule)
             continue
         hint = rules_mod.rule_like_problem(line, listed)
@@ -543,25 +613,34 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     `adr_dir` is None (look in the usual places), one directory or a list of
     them; see find_adrs()."""
     problems: "list[str]" = []
-    layers, arch_rules = load_arch_yaml(root, problems)
+    filters: dict = {}
+    layers, arch_rules = load_arch_yaml(root, problems, filters)
     adrs: "list[dict]" = []
     search = find_adrs(root, adr_dir)
     warnings: "list[str]" = list(search.warnings)
     for p in search.files:
         shown = os.path.relpath(p, root).replace(os.sep, "/")
         try:
-            adrs.append(parse_adr(p, display=shown))
+            adrs.append(parse_adr(p, display=shown, root=root))
         except ConfigError as e:
             problems.extend(e.problems)
         except OSError as e:
-            problems.append(f"{shown}: cannot read ({e})")
+            problems.append(f"{shown}: cannot read "
+                            f"({e.strerror or e})")
     if problems:
         raise ConfigError(problems)
     all_rules = list(arch_rules)
+    notes: "list[str]" = []
     for a in adrs:
         all_rules.extend(a["rules"])
         warnings.extend(a["warnings"])
-    return Loaded(layers, all_rules, adrs, warnings)
+        if a["retired"]:
+            shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+            notes.append(
+                f"{shown}: status '{a['status']}': this ADR is {a['retired']}"
+                ", so its Constraints are not enforced")
+    return Loaded(layers, all_rules, adrs, warnings, notes,
+                  filters.get("exclude", []), filters.get("include", []))
 
 
 def load_all_rules(root: str, adr_dir=None

@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
+import datetime
 import os
 import re
+import signal
+import sys
+import threading
+import time
 
 from . import config as config_mod
 from . import diag as diag_mod
@@ -14,14 +20,76 @@ from . import rules as rules_mod
 from . import scanner as scanner_mod
 
 
+#: Seconds one pattern rule may take, and seconds the whole rule evaluation may
+#: take (the command line sets them: --rule-timeout, --timeout).
+LIMITS = {"rule": 10.0, "total": 300.0}
+
+
+class RuleTimeout(Exception):
+    """A rule (or the whole evaluation) ran out of time."""
+
+
+def _hard_exit(message: str) -> None:       # replaced in tests
+    try:
+        print("error: " + message, file=sys.stderr)
+        sys.stderr.flush()
+    finally:
+        os._exit(2)
+
+
+class _Deadline:
+    """Run a block under a time limit. On POSIX in the main thread a timer
+    signal interrupts the regex engine (it checks for signals as it runs) and a
+    RuleTimeout is raised. Elsewhere (Windows, or a worker thread) a watchdog
+    thread ends the process with exit status 2 and the same message, because a
+    running re.search cannot be interrupted any other way."""
+
+    def __init__(self, seconds: float, message: str):
+        self.seconds = max(0.001, seconds)
+        self.message = message
+        self._timer = None
+        self._old = None
+        self._done = False
+
+    def __enter__(self):
+        use_signal = (hasattr(signal, "setitimer")
+                      and threading.current_thread() is threading.main_thread())
+        if use_signal:
+            def fire(signum, frame):
+                raise RuleTimeout(self.message)
+            self._old = signal.signal(signal.SIGALRM, fire)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        else:
+            def watchdog():
+                if not self._done:
+                    _hard_exit(self.message)
+            self._timer = threading.Timer(self.seconds, watchdog)
+            self._timer.daemon = True
+            self._timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done = True
+        if self._timer is not None:
+            self._timer.cancel()
+        elif self._old is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._old)
+        return False
+
+
 @dataclasses.dataclass
 class Violation:
     rule: rules_mod.Rule
     file: str          # repo-relative path
     line: int          # 0 when the whole file is the subject
     detail: str
+    #: ISO date of a temporary exception that has run out ("" when the rule
+    #: never had one). Not part of what makes a violation the same one.
+    expired: str = ""
 
     def as_dict(self) -> dict:
+        """The stable core (what a baseline file stores)."""
         return {
             "rule": self.rule.describe(),
             "rule_source": (f"{self.rule.source}:{self.rule.line_no}"
@@ -31,6 +99,50 @@ class Violation:
             "detail": self.detail,
         }
 
+    def report_dict(self) -> dict:
+        """as_dict() plus what a reader needs to act: how to fix it, which
+        ADR it comes from and, for an exception that ran out, when."""
+        d = self.as_dict()
+        d["fix_hint"] = fix_hint(self)
+        d["adr"] = (dict(self.rule.adr) if self.rule.adr else None)
+        if self.expired:
+            d["exception_expired"] = self.expired
+        return d
+
+
+def adr_label(adr: "dict | None") -> str:
+    """"ADR 0002: No dynamic eval" (or "" for a rule from arch.yaml)."""
+    if not adr:
+        return ""
+    number = adr.get("number")
+    head = f"ADR {number:04d}" if isinstance(number, int) else "ADR"
+    title = adr.get("title") or ""
+    return f"{head}: {title}" if title else head
+
+
+def fix_hint(v: "Violation") -> str:
+    """One plain sentence on how to make the violation go away."""
+    rule = v.rule
+    where = f"{v.file}:{v.line}" if v.line else v.file
+    if rule.kind == "forbid-import":
+        mod = v.detail[len("imports "):] if v.detail.startswith(
+            "imports ") else v.detail
+        text = (f"Remove the import of {mod} at {where}, or reach it through "
+                "a layer that is allowed to use it.")
+    elif rule.kind == "forbid-pattern":
+        text = (f"Remove or rewrite the code at {where} that matches "
+                f"/{rule.regex}/.")
+    else:
+        text = f"Add code that matches /{rule.regex}/ to {v.file}."
+    if v.expired:
+        text += (f" The temporary exception ended on {v.expired}: fix the "
+                 "code, or (if the date was only a guess) set a new "
+                 "'allow-until' after agreeing it with the team.")
+    else:
+        text += (f" If the rule is out of date, change it in "
+                 f"{rule.source} instead.")
+    return text
+
 
 def identity(v: "Violation", renames: "dict | None" = None) -> tuple:
     """What makes a violation *the same one* from run to run: the file, the
@@ -38,6 +150,77 @@ def identity(v: "Violation", renames: "dict | None" = None) -> tuple:
     line, which moves whenever anything above it is edited. `renames` maps
     old paths to new ones, so a moved file keeps its violations."""
     return ((renames or {}).get(v.file, v.file), v.rule.describe(), v.detail)
+
+
+def apply_exceptions(violations: "list[Violation]", today: datetime.date
+                     ) -> "tuple[list[Violation], list[Violation]]":
+    """Split violations by temporary exceptions (`allow-until: DATE`).
+
+    -> (kept, allowed). A violation of a rule whose date is today or later is
+    allowed; one whose date has passed is kept and marked `expired`, so it
+    fails with a message that says why. Rules without a date are untouched.
+    """
+    kept: "list[Violation]" = []
+    allowed: "list[Violation]" = []
+    for v in violations:
+        until = v.rule.allow_until
+        if until is None:
+            kept.append(v)
+        elif today <= until:
+            allowed.append(v)
+        else:
+            kept.append(dataclasses.replace(v, expired=until.isoformat()))
+    return kept, allowed
+
+
+def exception_messages(all_rules: "list[rules_mod.Rule]",
+                       violations: "list[Violation]",
+                       allowed: "list[Violation]", today: datetime.date,
+                       complete: bool = True
+                       ) -> "tuple[list[str], list[str]]":
+    """(warnings, notes) about the temporary exceptions among `all_rules`.
+
+    `violations` are the ones that failed (expired exceptions among them),
+    `allowed` the ones an exception let through. A warning is something to
+    act on (an exception that has run out); a note is information. With
+    `complete` False (a partial scan, like drift) an expired exception with
+    no violation is not called unnecessary, because the scan did not look
+    at every file."""
+    warnings: "list[str]" = []
+    notes: "list[str]" = []
+    for rule in all_rules:
+        until = rule.allow_until
+        if until is None:
+            continue
+        mine = [v for v in violations if v.rule is rule]
+        let_through = [v for v in allowed if v.rule is rule]
+        where = rule.where()
+        if today > until:
+            days = (today - until).days
+            ago = f"{days} day{'' if days == 1 else 's'} ago"
+            if mine:
+                warnings.append(
+                    f"{where}: the temporary exception for rule "
+                    f"'{rule.describe()}' ended on {until.isoformat()} "
+                    f"({ago}); "
+                    + ("its 1 violation now fails" if len(mine) == 1 else
+                       f"its {len(mine)} violations now fail"))
+            elif complete:
+                warnings.append(
+                    f"{where}: the temporary exception for rule "
+                    f"'{rule.describe()}' ended on {until.isoformat()} "
+                    f"({ago}) and is no longer needed: delete "
+                    "'allow-until' from the rule")
+        else:
+            left = (until - today).days
+            when = ("today" if left == 0 else
+                    f"{left} more day{'' if left == 1 else 's'}")
+            notes.append(
+                f"{where}: temporary exception for rule '{rule.describe()}' "
+                f"until {until.isoformat()} (still valid {when}); it lets "
+                f"{len(let_through)} violation"
+                f"{'' if len(let_through) == 1 else 's'} through")
+    return warnings, notes
 
 
 def _unpaired(current: list, known: list) -> "tuple[list[int], list[int]]":
@@ -184,9 +367,18 @@ def _from_hit(rule: rules_mod.Rule, rel: str, layer: str) -> bool:
     return rules_mod.match_pat(rule.from_pat, mod_prefix)
 
 
+def selected(rel: str, exclude=(), include=()) -> bool:
+    """Is this repo-relative path scanned? `include` (when given) lists the
+    only places to look; `exclude` removes paths from that."""
+    if include and not any(rules_mod.match_glob(g, rel) for g in include):
+        return False
+    return not any(rules_mod.match_glob(g, rel) for g in exclude)
+
+
 def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
           strict_py_only: bool = False,
-          diag: "diag_mod.Diagnostics | None" = None) -> list[Violation]:
+          diag: "diag_mod.Diagnostics | None" = None,
+          exclude=(), include=()) -> list[Violation]:
     """Scan `root` and evaluate every rule.
 
     Warnings (a rule or layer that covers no file, ...) go to `diag`, which
@@ -198,12 +390,22 @@ def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
     seen: dict[str, list[int]] = {}   # language -> [files, files with imports]
     for path in scanner_mod.iter_source_files(root):
         rel = _rel(root, path)
+        if not selected(rel, exclude, include):
+            continue
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError as e:
+            data = scanner_mod.read_regular(
+                path, scanner_mod.MAX_SOURCE_BYTES, root=root)
+        except scanner_mod.RefusedFile as e:
+            # A committed link to /dev/zero would be read for ever, a named
+            # pipe would block, a link out of the repo would be read from
+            # outside it; a link that stays in the repo is checked as the
+            # file it points to.
+            diag.warn(f"{rel}: {e.strerror}; not checked")
+            continue
+        except (OSError, MemoryError) as e:
             # A file that cannot be read is not checked: never silently.
-            diag.warn(f"{rel}: cannot read ({e.strerror or type(e).__name__})"
+            diag.warn(f"{rel}: cannot read "
+                      f"({getattr(e, 'strerror', None) or type(e).__name__})"
                       "; not checked")
             continue
         imports, engine = scanner_mod.extract_imports(
@@ -329,38 +531,60 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
     Lets `drift` check historical git content through the same engine.
     """
     violations: list[Violation] = []
+    started = time.monotonic()
+    lines_of: dict[str, list[str]] = {}     # each file is split once, not once per rule
     for rule in all_rules:
-        if rule.kind == "forbid-import":
-            for rel, layer, imports, _content in entries:
-                if not _from_hit(rule, rel, layer):
-                    continue
-                hit_lines: set[int] = set()
-                for mod, lineno in imports:
-                    # "from m import n" yields m and m.n: report a line once.
-                    if lineno in hit_lines:
-                        continue
-                    if any(rules_mod.match_pat(rule.to_pat, ident)
-                           for ident in _import_identities(mod, layers)):
-                        hit_lines.add(lineno)
-                        violations.append(Violation(
-                            rule=rule, file=rel, line=lineno,
-                            detail=f"imports {mod}"))
+        if rule.kind != "forbid-import":
+            left = LIMITS["total"] - (time.monotonic() - started)
+            if left <= 0:
+                raise RuleTimeout(
+                    f"the rule evaluation ran longer than --timeout "
+                    f"({LIMITS['total']:g}s); raise it, or simplify the "
+                    f"pattern rules (stopped before '{rule.describe()}')")
+            guard = _Deadline(min(LIMITS["rule"], left),
+                              f"rule '{rule.describe()}' ({rule.source}) took "
+                              f"longer than {min(LIMITS['rule'], left):g}s: its "
+                              "pattern is probably catastrophic "
+                              "(--rule-timeout / --timeout change the limits)")
         else:
-            rx = re.compile(rule.regex)
-            for rel, _layer, _imports, content in entries:
-                if not rules_mod.match_glob(rule.glob, rel):
-                    continue
-                if rule.kind == "forbid-pattern":
-                    for i, line in enumerate(
-                            scanner_mod.split_lines(content), 1):
-                        if rx.search(line):
-                            violations.append(Violation(
-                                rule=rule, file=rel, line=i,
-                                detail=f"matches /{rule.regex}/"))
-                else:  # require-pattern
-                    if not rx.search(content):
-                        violations.append(Violation(
-                            rule=rule, file=rel, line=0,
-                            detail=f"missing /{rule.regex}/"))
+            guard = contextlib.nullcontext()
+        with guard:
+            _evaluate_rule(rule, entries, layers, violations, lines_of)
     violations.sort(key=lambda v: (v.file, v.line))
     return violations
+
+
+def _evaluate_rule(rule, entries, layers, violations, lines_of) -> None:
+    if rule.kind == "forbid-import":
+        for rel, layer, imports, _content in entries:
+            if not _from_hit(rule, rel, layer):
+                continue
+            hit_lines: set[int] = set()
+            for mod, lineno in imports:
+                # "from m import n" yields m and m.n: report a line once.
+                if lineno in hit_lines:
+                    continue
+                if any(rules_mod.match_pat(rule.to_pat, ident)
+                       for ident in _import_identities(mod, layers)):
+                    hit_lines.add(lineno)
+                    violations.append(Violation(
+                        rule=rule, file=rel, line=lineno,
+                        detail=f"imports {mod}"))
+    else:
+        rx = re.compile(rule.regex)
+        for rel, _layer, _imports, content in entries:
+            if not rules_mod.match_glob(rule.glob, rel):
+                continue
+            if rule.kind == "forbid-pattern":
+                if rel not in lines_of:
+                    lines_of[rel] = scanner_mod.split_lines(content)
+                for i, line in enumerate(lines_of[rel], 1):
+                    if rx.search(line):
+                        violations.append(Violation(
+                            rule=rule, file=rel, line=i,
+                            detail=f"matches /{rule.regex}/"))
+            else:  # require-pattern
+                if not rx.search(content):
+                    violations.append(Violation(
+                        rule=rule, file=rel, line=0,
+                        detail=f"missing /{rule.regex}/"))

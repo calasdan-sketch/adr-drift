@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import errno
 import json
 import os
@@ -27,7 +28,9 @@ from . import diag as diag_mod
 from . import engine as engine_mod
 from . import githelp
 from . import langs as langs_mod
+from . import report as report_mod
 from . import rules as rules_mod
+from . import sarif as sarif_mod
 from . import scanner as scanner_mod
 
 VERSION = __version__
@@ -260,6 +263,9 @@ def _nothing_to_enforce(args) -> int:
     if getattr(args, "format", "human") == "json":
         print("[]")
         print(message, file=sys.stderr)
+    elif getattr(args, "format", "human") == "sarif":
+        print(json.dumps(sarif_mod.build([], [], VERSION), indent=2))
+        print(message, file=sys.stderr)
     else:
         print(message)
     return 0
@@ -283,9 +289,17 @@ def _adrs_read(n: int) -> str:
     return f"{n} ADR{'' if n == 1 else 's'} read"
 
 
-def _print_violations(violations, fmt: str, adr_count: int) -> None:
+def _print_violations(violations, fmt: str, adr_count: int,
+                      rules=()) -> None:
     if fmt == "json":
-        print(json.dumps([v.as_dict() for v in violations], indent=2))
+        print(json.dumps([v.report_dict() for v in violations], indent=2))
+        return
+    if fmt == "sarif":
+        print(json.dumps(sarif_mod.build(violations, rules, VERSION),
+                         indent=2))
+        return
+    if fmt == "markdown":
+        print(report_mod.markdown(violations, "adr-drift", adr_count), end="")
         return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
@@ -304,7 +318,81 @@ def _print_violations(violations, fmt: str, adr_count: int) -> None:
         for v in by_file[path]:
             where = f":{v.line}" if v.line else ""
             print(f"    {path}{where}: {v.detail}")
-            print(f"      rule: {v.rule.describe()} ({v.rule.source})")
+            _print_rule_lines(v, indent="      ")
+
+
+def _print_rule_lines(v, indent: str) -> None:
+    """The lines under a violation: its rule, the ADR it comes from, how to
+    fix it."""
+    print(f"{indent}rule: {v.rule.describe()} ({v.rule.source})")
+    label = engine_mod.adr_label(v.rule.adr)
+    if label:
+        print(f"{indent}{label} ({v.rule.adr['path']})")
+    if v.expired:
+        print(f"{indent}the temporary exception for this rule ended on "
+              f"{v.expired}")
+    print(f"{indent}fix: {engine_mod.fix_hint(v)}")
+
+
+def _today(args) -> datetime.date:
+    """Today, or the date given with --today (reproducible runs)."""
+    given = getattr(args, "today", None)
+    return given if given else datetime.date.today()
+
+
+def _date_arg(value: str) -> datetime.date:
+    try:
+        if len(value) != 10:
+            raise ValueError
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a date like 2026-12-31") from None
+
+
+def _settle_exceptions(args, loaded, violations, diag, complete=True):
+    """Apply the temporary exceptions: -> the violations that fail.
+
+    Adds a warning for every exception that has run out, one line on stderr
+    for violations an exception let through (always: green must not hide
+    them) and, with --verbose, the details."""
+    if not any(r.allow_until for r in loaded.rules):
+        return violations
+    today = _today(args)
+    kept, allowed = engine_mod.apply_exceptions(violations, today)
+    warnings, notes = engine_mod.exception_messages(
+        loaded.rules, kept, allowed, today, complete=complete)
+    for message in warnings:
+        diag.warn(message)
+    if allowed:
+        n = len(allowed)
+        print(f"note: {n} violation{'' if n == 1 else 's'} allowed by "
+              "temporary exceptions (allow-until)"
+              + ("" if getattr(args, "verbose", False)
+                 else "; --verbose lists them"), file=sys.stderr)
+    if getattr(args, "verbose", False):
+        for message in notes:
+            print(f"note: {message}", file=sys.stderr)
+        for v in allowed:
+            where = f"{v.file}:{v.line}" if v.line else v.file
+            print(f"note: allowed until {v.rule.allow_until.isoformat()}: "
+                  f"{where}: {v.detail}", file=sys.stderr)
+    return kept
+
+
+def _retired_hint(args, loaded) -> None:
+    """When retired ADRs are why there is nothing to enforce, say so."""
+    if loaded.notes and not getattr(args, "verbose", False):
+        n = len(loaded.notes)
+        print(f"note: {n} ADR{'' if n == 1 else 's'} superseded or "
+              "deprecated, so not enforced; --verbose lists them",
+              file=sys.stderr)
+
+
+def _verbose_notes(args, loaded) -> None:
+    if getattr(args, "verbose", False):
+        for message in loaded.notes:
+            print(f"note: {message}", file=sys.stderr)
 
 
 def cmd_check(args) -> int:
@@ -315,7 +403,9 @@ def cmd_check(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _verbose_notes(args, loaded)
     if not loaded.rules:
+        _retired_hint(args, loaded)
         return _nothing_to_enforce(args)
     entries = None
     if args.baseline:
@@ -324,10 +414,12 @@ def cmd_check(args) -> int:
             return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
+                                  diag=diag, exclude=loaded.exclude,
+                                  include=loaded.include)
+    violations = _settle_exceptions(args, loaded, violations, diag)
     if entries is not None:
         violations = engine_mod.not_baselined(violations, entries)
-    _print_violations(violations, args.format, len(loaded.adrs))
+    _print_violations(violations, args.format, len(loaded.adrs), loaded.rules)
     return _verdict(args, violations, diag)
 
 
@@ -371,7 +463,10 @@ def cmd_baseline(args) -> int:
         return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
+                                  diag=diag, exclude=loaded.exclude,
+                                  include=loaded.include)
+    violations = engine_mod.apply_exceptions(violations,
+                                             datetime.date.today())[0]
     out = (args.output if os.path.isabs(args.output)
            else os.path.join(root, args.output))
     with open(out, "w", encoding="utf-8") as f:
@@ -397,42 +492,10 @@ def _git_failed(e: "githelp.GitError") -> int:
     return 2
 
 
-def cmd_drift(args) -> int:
-    root = args.root
-    try:
-        githelp.require_repo(root)
-    except githelp.GitError as e:
-        return _git_failed(e)
-    loaded = _load_or_report(root, args.adr_dir)
-    if loaded is None:
-        return 2
+def _compare(root, loaded, changed, blobs, diag):
+    """(new, fixed) violations between the two sides of `changed` (a list of
+    githelp.Change with their blobs read)."""
     layers, all_rules = loaded.layers, loaded.rules
-    diag = diag_mod.Diagnostics()
-    for message in loaded.warnings:
-        diag.warn(message)
-    if not all_rules:
-        return _nothing_to_enforce(args)
-
-    # Compare commits: the base ref against HEAD. Both sides are read out of
-    # git, so the working tree (uncommitted edits) never matters, and a
-    # non-ASCII name is whatever git says it is.
-    try:
-        githelp.head_commit(root)
-        base = githelp.resolve_commit(root, args.since)
-        changed = [c for c in githelp.changes(root, base)
-                   if _is_source(c.path) or _is_source(c.old_path)]
-        blobs = githelp.read_blobs(
-            root, [b for c in changed for b in (c.old_blob, c.new_blob)])
-    except githelp.GitError as e:
-        return _git_failed(e)
-    if not changed:
-        if args.format == "json":
-            print("[]")
-        else:
-            print(f"no source files changed since {args.since} "
-                  f"{sym('—')} no drift")
-        return _verdict(args, [], diag)
-
     quiet = diag_mod.Diagnostics(echo=False)  # the base side: warn once
     go_module = langs_mod.go_module_path(root)
 
@@ -459,11 +522,72 @@ def cmd_drift(args) -> int:
         engine_mod.evaluate(now_entries, layers, all_rules), renames)
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
+    return new_violations, fixed_violations
 
+
+def cmd_drift(args) -> int:
+    root = args.root
+    try:
+        githelp.require_repo(root)
+    except githelp.GitError as e:
+        return _git_failed(e)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
+        return 2
+    layers, all_rules = loaded.layers, loaded.rules
+    diag = diag_mod.Diagnostics()
+    for message in loaded.warnings:
+        diag.warn(message)
+    _verbose_notes(args, loaded)
+    if not all_rules:
+        _retired_hint(args, loaded)
+        return _nothing_to_enforce(args)
+
+    # Compare commits: the base ref against HEAD. Both sides are read out of
+    # git, so the working tree (uncommitted edits) never matters, and a
+    # non-ASCII name is whatever git says it is.
+    try:
+        githelp.head_commit(root)
+        base = githelp.resolve_commit(root, args.since)
+        changed = [c for c in githelp.changes(root, base)
+                   if (_is_source(c.path) or _is_source(c.old_path))
+                   and (engine_mod.selected(c.path, loaded.exclude, loaded.include)
+                        or (c.old_path and engine_mod.selected(
+                            c.old_path, loaded.exclude, loaded.include)))]
+        blobs = githelp.read_blobs(
+            root, [b for c in changed for b in (c.old_blob, c.new_blob)])
+    except githelp.GitError as e:
+        return _git_failed(e)
+    if not changed:
+        if args.format == "sarif":
+            print(json.dumps(sarif_mod.build([], all_rules, VERSION),
+                             indent=2))
+        elif args.format == "json":
+            print("[]")
+        elif args.format == "markdown":
+            print(report_mod.markdown([], f"adr-drift: new since {args.since}",
+                                      len(loaded.adrs)), end="")
+        else:
+            print(f"no source files changed since {args.since} "
+                  f"{sym('—')} no drift")
+        return _verdict(args, [], diag)
+
+    new_violations, fixed_violations = _compare(
+        root, loaded, changed, blobs, diag)
+
+    new_violations = _settle_exceptions(args, loaded, new_violations, diag,
+                                        complete=False)
     if args.format == "json":
         # Stable contract: the JSON list is the NEW violations, as before.
         # Fixed violations are reported in the human output.
-        print(json.dumps([v.as_dict() for v in new_violations], indent=2))
+        print(json.dumps([v.report_dict() for v in new_violations], indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(sarif_mod.build(new_violations, loaded.rules,
+                                         VERSION), indent=2))
+    elif args.format == "markdown":
+        print(report_mod.markdown(new_violations,
+                                  f"adr-drift: new since {args.since}",
+                                  len(loaded.adrs), fixed_violations), end="")
     else:
         if not new_violations:
             print(f"{sym('✓')} no new drift since {args.since} "
@@ -477,7 +601,7 @@ def cmd_drift(args) -> int:
                     root, v.file, v.line or 1)
                 tag = f" [{commit}]" if commit else ""
                 print(f"  {v.file}:{v.line or sym('—')}{tag}: {v.detail}")
-                print(f"      rule: {v.rule.describe()} ({v.rule.source})")
+                _print_rule_lines(v, indent="      ")
         if fixed_violations:
             print(f"\n{sym('✓')} {len(fixed_violations)} fixed since "
                   f"{args.since}:\n")
@@ -485,6 +609,47 @@ def cmd_drift(args) -> int:
                 print(f"  {v.file}:{v.line or sym('—')}: {v.detail} (fixed)")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
     return _verdict(args, new_violations, diag)
+
+
+def cmd_report(args) -> int:
+    """The drift trend page: for each commit after --since, the violations it
+    added and fixed (the same comparison `drift` makes), as one HTML file."""
+    root = args.root
+    try:
+        githelp.require_repo(root)
+        base = githelp.resolve_commit(root, args.since)
+        githelp.head_commit(root)
+        commits = githelp.commits_since(root, base, max(1, args.max_commits))
+    except githelp.GitError as e:
+        return _git_failed(e)
+    loaded = _load_or_report(root, args.adr_dir)
+    if loaded is None:
+        return 2
+    if not loaded.rules:
+        return _nothing_to_enforce(args)
+    diag = diag_mod.Diagnostics(echo=False)
+    points, per_rule = [], {}
+    prev = base
+    try:
+        for sha, subject in commits:
+            changed = [c for c in githelp.changes(root, prev, sha)
+                       if (_is_source(c.path) or _is_source(c.old_path))
+                       and engine_mod.selected(c.path, loaded.exclude, loaded.include)]
+            blobs = githelp.read_blobs(
+                root, [b for c in changed for b in (c.old_blob, c.new_blob)])
+            new, fixed = _compare(root, loaded, changed, blobs, diag)
+            for v in new:
+                per_rule[v.rule.describe()] = per_rule.get(v.rule.describe(), 0) + 1
+            points.append({"commit": sha, "subject": subject,
+                           "new": len(new), "fixed": len(fixed)})
+            prev = sha
+    except githelp.GitError as e:
+        return _git_failed(e)
+    page = report_mod.html_page(points, args.since, per_rule)
+    with open(args.html, "w", encoding="utf-8", newline="\n") as f:
+        f.write(page)
+    print(f"wrote {args.html} ({len(points)} commit(s))")
+    return 0
 
 
 def cmd_new(args) -> int:
@@ -510,7 +675,7 @@ def _write_index(root: str, adr_rel: str) -> int:
     -> how many there are."""
     adr_dir = os.path.join(root, adr_rel)
     # Metadata only: the index must still build while a constraint is broken.
-    adrs = [config_mod.parse_adr(p, parse_rules=False)
+    adrs = [config_mod.parse_adr(p, parse_rules=False, root=root)
             for p in config_mod.adr_files(root, adr_rel)]
     lines = [INDEX_MARKER + "\n",
              "# Architecture Decision Records\n",
@@ -587,6 +752,39 @@ def _adr_dir_arg(value: str) -> str:
     return value
 
 
+def _positive(value: str) -> float:
+    try:
+        x = float(value)
+    except ValueError:
+        x = 0.0
+    if not x > 0:
+        raise argparse.ArgumentTypeError(f"{value!r}: want a number of seconds above 0")
+    return x
+
+
+def _add_limit_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--timeout", type=_positive, default=None, metavar="SECONDS",
+                        help="Stop (exit 2) if evaluating all rules takes longer "
+                             "than this (default: 300).")
+    parser.add_argument("--rule-timeout", type=_positive, default=None, metavar="SECONDS",
+                        help="Stop (exit 2) if one pattern rule takes longer than "
+                             "this (default: 10). A catastrophic regex is "
+                             "refused when the rule loads; this is the second "
+                             "line of defence.")
+
+
+def _add_report_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--verbose", action="store_true",
+                        help="Also say, on stderr, which ADRs are not "
+                             "enforced (superseded or deprecated) and which "
+                             "temporary exceptions are letting violations "
+                             "through.")
+    parser.add_argument("--today", type=_date_arg, default=None,
+                        metavar="YYYY-MM-DD",
+                        help="Treat this as today's date when judging "
+                             "'allow-until' exceptions (reproducible runs).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="adr-drift",
@@ -610,7 +808,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("check", parents=where,
                        help="Verify the repo against all rules.")
-    c.add_argument("--format", choices=["human", "json"], default="human")
+    c.add_argument("--format", choices=["human", "json", "sarif", "markdown"],
+                   default="human",
+                   help="human text (default), a JSON list, a SARIF 2.1.0 "
+                        "log for code-scanning tools, or markdown for a pull "
+                        "request comment.")
+    _add_report_options(c)
+    _add_limit_options(c)
     c.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     c.add_argument("--strict-py-only", action="store_true",
@@ -632,6 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: .adr-baseline.json under --root).")
     b.add_argument("--strict-py-only", action="store_true",
                    help="Skip the regex fallback for non-Python files.")
+    _add_limit_options(b)
     b.add_argument("--allow-empty", action="store_true",
                    help="Write an empty baseline when there are no rules "
                         "(default: exit 2).")
@@ -640,7 +845,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="New violations since a git ref.")
     d.add_argument("--since", default="HEAD~5",
                    help="Git ref to compare against (default: HEAD~5).")
-    d.add_argument("--format", choices=["human", "json"], default="human")
+    d.add_argument("--format", choices=["human", "json", "sarif", "markdown"],
+                   default="human",
+                   help="human text (default), a JSON list of the new "
+                        "violations, or a SARIF 2.1.0 log of them.")
+    _add_report_options(d)
+    _add_limit_options(d)
     d.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     d.add_argument("--allow-empty", action="store_true",
@@ -648,6 +858,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "exit 2, because nothing would be enforced).")
     d.add_argument("--strict", action="store_true",
                    help="Treat warnings as errors: exit 2.")
+
+    r = sub.add_parser("report", parents=where,
+                       help="Write an HTML page: violations added and fixed, "
+                            "commit by commit, since a git ref.")
+    r.add_argument("--html", required=True, metavar="FILE",
+                   help="Where to write the page.")
+    r.add_argument("--since", default="HEAD~20",
+                   help="Git ref to start from (default: HEAD~20).")
+    r.add_argument("--max-commits", type=int, default=30, metavar="N",
+                   help="At most the newest N commits (default: 30).")
+    _add_limit_options(r)
 
     n = sub.add_parser("new", parents=where,
                        help="Create the next-numbered ADR.")
@@ -735,34 +956,84 @@ class _PipeSafe:
         return getattr(self._stream, name)
 
 
+class _StreamState:
+    """What happened to the output streams while main() ran."""
+
+    def __init__(self):
+        self.write_error = None   # the OSError that stopped the output
+        self.reported = False     # an "error:" line already says so
+
+
 @contextlib.contextmanager
 def _closed_pipe_tolerant():
-    """Run the body with stdout and stderr wrapped in _PipeSafe."""
+    """Run the body with stdout and stderr wrapped in _PipeSafe. Yields a
+    _StreamState; a stream that cannot take its output (a full disk, `>
+    /dev/full`) is recorded there, never raised, because this runs after
+    the command: a traceback here would replace its exit code with 1 or
+    120."""
+    state = _StreamState()
     real = (sys.stdout, sys.stderr)  # either is None under pythonw
     safe = tuple(_PipeSafe(s) if s is not None else None for s in real)
     sys.stdout, sys.stderr = safe
     try:
-        yield
+        yield state
     finally:
-        try:
-            # Flush now, with the command done, while a closed pipe is
-            # still handled. A small output only ever sits in the buffer,
-            # so nothing has failed yet; left to the interpreter's flush
-            # at exit, the error would be "Exception ignored" and the exit
-            # code 120 instead of the command's own.
-            for s in safe:
-                if s is not None:
-                    s.flush()
-        finally:
-            sys.stdout, sys.stderr = real
+        # Flush now, with the command done, while a closed pipe is still
+        # handled. A small output only ever sits in the buffer, so nothing
+        # has failed yet; left to the interpreter's flush at exit, the
+        # error would be "Exception ignored" and the exit code 120 instead
+        # of the command's own.
+        for s, raw in zip(safe, real):
+            if s is None:
+                continue
+            try:
+                s.flush()
+            except (OSError, ValueError) as e:
+                if state.write_error is None:
+                    state.write_error = e
+                # what is left in the buffer must not fail again at exit
+                _discard_output(raw)
+        sys.stdout, sys.stderr = real
 
 
 def main(argv=None) -> int:
     _harden_streams()
     # `adr-drift check | head -1` must neither traceback nor change the exit
     # code (check's exit code is the verdict).
-    with _closed_pipe_tolerant():
-        return _main(argv)
+    with _closed_pipe_tolerant() as state:
+        try:
+            rc = _main(argv)
+        except OSError as e:
+            # A file or stream the OS refused (a full disk under `> file`, an
+            # unwritable stderr): exit 2, the documented "could not run"
+            # code, never a traceback with 1, which means "violations found".
+            state.reported = _fail_quietly(
+                f"error: {e.strerror or type(e).__name__}"
+                + (f": {e.filename}" if e.filename else ""))
+            rc = 2
+        except MemoryError:
+            state.reported = _fail_quietly("error: out of memory")
+            rc = 2
+    if state.write_error is not None:
+        # The output could not be written (found when the streams were
+        # flushed). The verdict was never delivered: exit 2, one line.
+        if not state.reported:
+            e = state.write_error
+            _fail_quietly("error: could not write the output: "
+                          f"{getattr(e, 'strerror', None) or e}")
+        return 2
+    return rc
+
+
+def _fail_quietly(message: str) -> bool:
+    """One line on stderr, if stderr can take it. True when it was said."""
+    try:
+        print(message, file=sys.stderr)
+        sys.stderr.flush()
+        return True
+    except (OSError, ValueError):
+        _discard_output(sys.stderr)
+        return False
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -777,9 +1048,21 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def _main(argv) -> int:
     args = parse_args(argv)
-    return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
-            "drift": cmd_drift, "new": cmd_new,
-            "index": cmd_index}[args.cmd](args)
+    root = getattr(args, "root", None)
+    if root is not None and not os.path.isdir(root):
+        print(f"error: --root: not a directory: {root}", file=sys.stderr)
+        return 2
+    if getattr(args, "timeout", None):
+        engine_mod.LIMITS["total"] = args.timeout
+    if getattr(args, "rule_timeout", None):
+        engine_mod.LIMITS["rule"] = args.rule_timeout
+    try:
+        return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
+                "drift": cmd_drift, "new": cmd_new, "index": cmd_index,
+                "report": cmd_report}[args.cmd](args)
+    except engine_mod.RuleTimeout as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

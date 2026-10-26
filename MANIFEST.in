@@ -1,0 +1,9 @@
+include SECURITY.md
+# What setuptools leaves out of the sdist and the tests read: the action's
+# definition and the fixture repository. Every file under tests/ goes in, so an
+# unpacked sdist runs its own tests.
+include action.yml
+include CHANGELOG.md
+recursive-include tests *
+global-exclude __pycache__ *.py[cod]
+include .pre-commit-hooks.yaml

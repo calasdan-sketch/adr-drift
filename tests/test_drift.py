@@ -361,15 +361,16 @@ class TestJsonIsAlwaysJson(DriftCase):
         self.assertEqual(code, 2)
         self.assertIn("--allow-empty", err)
 
-    def test_new_violation_json_shape_is_unchanged(self):
+    def test_new_violation_json_keeps_its_original_keys(self):
         root = self.repo()
         self.commit(root, {"src/handlers/b.py": BAD})
         code, out, err = self.drift(root, "--since", "HEAD~1",
                                     "--format", "json")
         self.assertEqual(code, 1)
         (v,) = json.loads(out)
-        self.assertEqual(sorted(v), ["detail", "file", "line", "rule",
-                                     "rule_source"])
+        # 0.2.0 only ADDS keys (fix_hint, adr); the five original ones stay
+        self.assertEqual(sorted(v), ["adr", "detail", "file", "fix_hint",
+                                     "line", "rule", "rule_source"])
         self.assertEqual(v["file"], "src/handlers/b.py")
         self.assertEqual(v["line"], 1)
 

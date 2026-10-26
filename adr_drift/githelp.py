@@ -127,6 +127,20 @@ def head_commit(root: str) -> str:
                        "commit something, then run drift again") from None
 
 
+def commits_since(root: str, base: str, limit: int = 30) -> "list[tuple[str, str]]":
+    """(sha, subject) of the commits after `base` up to HEAD, oldest first
+    (first-parent), at most `limit` of the newest."""
+    out = _run(root, "log", "--first-parent", "--reverse", "-z",
+               "--format=%H%x1f%s", f"{base}..HEAD")
+    rows = []
+    for rec in out.split(b"\0"):
+        if b"\x1f" in rec:
+            sha, subject = rec.split(b"\x1f", 1)
+            rows.append((sha.decode("ascii", "replace").strip(),
+                         subject.decode("utf-8", "replace").strip()))
+    return rows[-limit:]
+
+
 @dataclasses.dataclass
 class Change:
     status: str      # A added, D deleted, M modified, R renamed, T type change

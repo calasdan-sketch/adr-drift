@@ -13,6 +13,7 @@ import ast
 import io
 import os
 import re
+import stat
 import sys
 import tokenize
 
@@ -177,9 +178,123 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
     return [], "none"
 
 
-def iter_source_files(root: str) -> list[str]:
-    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                 "dist", "build", ".tox", "vendor"}
+#: The biggest source file that is read (a bundle or a data dump with a source
+#: extension is not code anyone wrote): the read stops one byte past this.
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
+
+
+def is_regular(path: str) -> bool:
+    """A regular file: not a link (to a file, a directory, a device ...), not
+    a named pipe, not a device. Opening a link to /dev/zero reads for ever and
+    a repository can hold the link (git stores links)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+#: The biggest ADR or arch.yaml that is read: they are prose and a few lines
+#: of rules, never megabytes.
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+class RefusedFile(OSError):
+    """A file adr-drift will not open; `strerror` says why in plain words."""
+
+    def __init__(self, why: str):
+        super().__init__(0, why)
+
+
+def _inside(real: str, real_root: str) -> bool:
+    real, real_root = os.path.normcase(real), os.path.normcase(real_root)
+    return real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def resolve_readable(path: str, root: "str | None" = None) -> str:
+    """The path to open for `path`, or RefusedFile.
+
+    A regular file is opened as it is. A link is followed only when it ends
+    at a regular file and, when `root` is given, that file lies inside
+    `root`: a link out of the repository is never read, and a link to
+    /dev/zero (a repository can hold one: git stores links) would be read
+    for ever. Devices, pipes and directories are refused."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as e:
+        raise RefusedFile(e.strerror or "cannot be read") from None
+    if stat.S_ISREG(mode):
+        return path
+    if not stat.S_ISLNK(mode):
+        raise RefusedFile("not a regular file (a device, pipe or directory)")
+    real = os.path.realpath(path)
+    try:
+        if not stat.S_ISREG(os.stat(real).st_mode):
+            raise RefusedFile("not a regular file (a link to a device, "
+                              "pipe or directory)")
+    except OSError:
+        raise RefusedFile("not a regular file (a link that leads nowhere)") from None
+    if root is not None and not _inside(real, os.path.realpath(root)):
+        raise RefusedFile("not a regular file (a link that leaves the "
+                          "repository)")
+    return real
+
+
+def read_regular(path: str, limit: int, root: "str | None" = None) -> bytes:
+    """The bytes of a regular file of at most `limit` bytes. Raises
+    RefusedFile (also an OSError) for a file that is not read: not regular,
+    a link out of `root`, or bigger than `limit`. MemoryError is the
+    caller's to handle."""
+    try:
+        real = resolve_readable(path, root)
+        with open(real, "rb") as f:
+            data = f.read(limit + 1)
+        if len(data) > limit:
+            raise RefusedFile(f"bigger than {limit // (1024 * 1024)} MiB")
+    except RefusedFile as e:
+        e.filename = path
+        raise
+    return data
+
+
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+              "dist", "build", ".tox", "vendor"}
+
+
+def _listed_by_git(root: str) -> "list[str] | None":
+    """Tracked files plus untracked ones that .gitignore does not hide, as
+    absolute paths; None when `root` is not the top of a git work tree or git
+    cannot be run (the caller then walks the folder)."""
+    from . import githelp
+    try:
+        if not githelp.is_repo(root):
+            return None
+        raw = githelp._run(root, "ls-files", "-z", "--cached", "--others",
+                           "--exclude-standard")
+    except Exception:
+        return None
+    out = []
+    for name in raw.decode("utf-8", "surrogateescape").split("\0"):
+        if not name:
+            continue
+        parts = name.split("/")
+        if any(p in _SKIP_DIRS for p in parts[:-1]):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        path = os.path.join(root, *parts)
+        if (ext in PY_EXTS or ext in GENERIC_EXTS) and os.path.lexists(path):
+            out.append(path)
+    return sorted(set(out))
+
+
+def iter_source_files(root: str, use_git: bool = True) -> list[str]:
+    """The source files to check. In a git work tree: what git lists (so
+    .gitignore is honoured and generated folders never need naming); else a
+    walk that skips the usual build and dependency folders."""
+    if use_git:
+        listed = _listed_by_git(root)
+        if listed is not None:
+            return listed
+    skip_dirs = _SKIP_DIRS
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]

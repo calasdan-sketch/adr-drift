@@ -58,9 +58,15 @@ class TestExitCodeSurvivesAClosedPipe(unittest.TestCase):
         for code in (0, 1, 3):
             self.assertEqual(self._run(True, code), code)
 
-    def test_einval_is_still_an_error_off_windows(self):
-        with self.assertRaises(OSError):
-            self._run(False, 0)
+    def test_einval_off_windows_is_a_write_failure_with_exit_2(self):
+        # EINVAL is a real error off Windows: the output was lost, so the
+        # verdict never arrived. Exit 2 and one line, not a traceback.
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertEqual(self._run(False, 0), 2)
+        lines = [ln for ln in err.getvalue().splitlines() if ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("error:"), lines)
 
 
 class TestRealClosedPipe(unittest.TestCase):

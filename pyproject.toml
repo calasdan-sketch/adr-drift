@@ -1,11 +1,39 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "adr-drift"
-version = "0.1.2"
+version = "0.2.0"
 description = "Deterministic architecture tests: keep the codebase honest about its own ADRs."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Calas Automations Inc."}]
+keywords = ["adr", "architecture", "architecture-decision-records", "linter", "ci", "static-analysis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/calasdan-sketch/adr-drift"
+Repository = "https://github.com/calasdan-sketch/adr-drift"
+Issues = "https://github.com/calasdan-sketch/adr-drift/issues"
 [project.scripts]
 adr-drift = "adr_drift.cli:main"
+
+[tool.setuptools]
+packages = ["adr_drift"]
+
+[tool.setuptools.package-data]
+adr_drift = ["py.typed"]
