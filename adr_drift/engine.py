@@ -20,9 +20,12 @@ class Violation:
     file: str          # repo-relative path
     line: int          # 0 when the whole file is the subject
     detail: str
+    #: forbid-cycles: one "file:line imports module" per edge of the cycle.
+    #: Shown to people, never part of the identity (see identity()).
+    evidence: list = dataclasses.field(default_factory=list)
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "rule": self.rule.describe(),
             "rule_source": (f"{self.rule.source}:{self.rule.line_no}"
                             if self.rule.line_no else self.rule.source),
@@ -30,6 +33,9 @@ class Violation:
             "line": self.line,
             "detail": self.detail,
         }
+        if self.evidence:
+            out["evidence"] = list(self.evidence)
+        return out
 
 
 def identity(v: "Violation", renames: "dict | None" = None) -> tuple:
@@ -174,6 +180,57 @@ def _import_identities(mod: str, layers: list[dict]) -> list[str]:
     return ids
 
 
+class IdentityIndex:
+    """_import_identities() for many modules against one list of layers,
+    without its cost: the layers' path prefixes are indexed once (by every
+    suffix _import_identities() tries), so a module costs one dictionary
+    look-up per dotted prefix of its own name instead of a pass over every
+    layer, and each module is worked out once. A repo with L layers and N
+    imports was O(N * L); it is now about O(N * depth). Same answers, in the
+    same order, as _import_identities() (tests compare the two)."""
+
+    def __init__(self, layers: list[dict]):
+        self._layers = layers
+        # suffix -> [(layer index, prefix index, k)], k ascending per prefix
+        self._by_suffix: dict = collections.defaultdict(list)
+        self._parts: dict = {}
+        for li, layer in enumerate(layers):
+            for pi, prefix in enumerate(_layer_path_prefixes(layer)):
+                parts = prefix.split(".")
+                self._parts[(li, pi)] = parts
+                for k in range(len(parts)):
+                    key = rules_mod._norm(".".join(parts[k:]))
+                    self._by_suffix[key].append((li, pi, k))
+        self._cache: dict = {}
+
+    def of(self, mod: str) -> "list[str]":
+        hit = self._cache.get(mod)
+        if hit is not None:
+            return hit
+        v = rules_mod._norm(mod)
+        pieces = v.split(".")
+        first_k: dict = {}
+        for n in range(1, len(pieces) + 1):
+            for li, pi, k in self._by_suffix.get(".".join(pieces[:n]), ()):
+                if k < first_k.get((li, pi), k + 1):
+                    first_k[(li, pi)] = k
+        ids = [mod]
+        dotted = mod.replace("/", ".").strip(".")
+        for (li, pi) in sorted(first_k):
+            k = first_k[(li, pi)]
+            parts = self._parts[(li, pi)]
+            name = self._layers[li].get("name", "")
+            if name and name not in ids:
+                ids.append(name)
+            canonical = parts[:k] + dotted.split(".")
+            for j in range(len(parts)):
+                form = ".".join(canonical[j:])
+                if form and form not in ids:
+                    ids.append(form)
+        self._cache[mod] = ids
+        return ids
+
+
 def _from_hit(rule: rules_mod.Rule, rel: str, layer: str) -> bool:
     """Does the rule's "from" side cover this file? It matches the file's
     layer name OR a module prefix of its path (so rules work without
@@ -313,6 +370,15 @@ def coverage_warnings(entries: list, layers: list[dict],
                 out.append(f"{where}: rule '{rule.describe()}': target "
                            f"'{rule.to_pat}' is not a layer or a path in "
                            f"this repo{hint}")
+        elif rule.kind == "forbid-cycles":
+            hit = [l["name"] for l in layers
+                   if rules_mod.match_pat(rule.from_pat, l.get("name", ""))]
+            if len(hit) < 2:
+                out.append(f"{where}: '{rule.from_pat}' matches "
+                           f"{len(hit)} layer{'' if len(hit) == 1 else 's'} "
+                           f"in {config_mod.ARCH_FILE}; a cycle needs at "
+                           f"least two, so rule '{rule.describe()}' "
+                           "enforces nothing")
         elif not any(rules_mod.match_glob(rule.glob, rel)
                      for rel, _l, _i, _c in entries):
             out.append(f"{where}: '{rule.glob}' matches no scanned source "
@@ -329,8 +395,12 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
     Lets `drift` check historical git content through the same engine.
     """
     violations: list[Violation] = []
+    index = IdentityIndex(layers)
     for rule in all_rules:
-        if rule.kind == "forbid-import":
+        if rule.kind == "forbid-cycles":
+            violations.extend(_cycle_violations(rule, entries, layers,
+                                                index))
+        elif rule.kind == "forbid-import":
             for rel, layer, imports, _content in entries:
                 if not _from_hit(rule, rel, layer):
                     continue
@@ -340,7 +410,7 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                     if lineno in hit_lines:
                         continue
                     if any(rules_mod.match_pat(rule.to_pat, ident)
-                           for ident in _import_identities(mod, layers)):
+                           for ident in index.of(mod)):
                         hit_lines.add(lineno)
                         violations.append(Violation(
                             rule=rule, file=rel, line=lineno,
@@ -364,3 +434,159 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                             detail=f"missing /{rule.regex}/"))
     violations.sort(key=lambda v: (v.file, v.line))
     return violations
+
+
+# -- forbid-cycles --------------------------------------------------------------
+
+def _layer_edges(rule: rules_mod.Rule, entries: list, layers: list[dict],
+                 index: "IdentityIndex | None" = None
+                 ) -> "dict[str, dict[str, tuple[str, int, str]]]":
+    """{layer: {imported layer: (file, line, module)}} for the layers the
+    rule covers; the evidence kept for an edge is its first import in
+    (file, line) order, so the report is the same on every run."""
+    covered = [l["name"] for l in layers
+               if rules_mod.match_pat(rule.from_pat, l.get("name", ""))]
+    names = set(covered)
+    index = index if index is not None else IdentityIndex(layers)
+    edges: dict = {name: {} for name in covered}
+    for rel, layer, imports, _content in sorted(entries, key=lambda e: e[0]):
+        if layer not in names:
+            continue
+        for mod, lineno in sorted(imports, key=lambda m: m[1]):
+            for ident in index.of(mod):
+                if ident in names and ident != layer:
+                    edges[layer].setdefault(ident, (rel, lineno, mod))
+    return edges
+
+
+def _strongly_connected(graph: "dict[str, dict]") -> "list[list[str]]":
+    """Tarjan's algorithm, iterative (no recursion limit on deep graphs):
+    the groups of nodes that can all reach each other, each sorted."""
+    index: dict = {}
+    low: dict = {}
+    on_stack: set = set()
+    stack: list = []
+    groups: list = []
+    counter = 0
+    for start in sorted(graph):
+        if start in index:
+            continue
+        work = [(start, iter(sorted(graph[start])))]
+        index[start] = low[start] = counter
+        counter += 1
+        stack.append(start)
+        on_stack.add(start)
+        while work:
+            node, children = work[-1]
+            advanced = False
+            for child in children:
+                if child not in index:
+                    index[child] = low[child] = counter
+                    counter += 1
+                    stack.append(child)
+                    on_stack.add(child)
+                    work.append((child, iter(sorted(graph.get(child, {})))))
+                    advanced = True
+                    break
+                if child in on_stack:
+                    low[node] = min(low[node], index[child])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                group = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    group.append(member)
+                    if member == node:
+                        break
+                groups.append(sorted(group))
+    return groups
+
+
+def _loop_from(graph: dict, members: set, start: str) -> "list[str]":
+    """The shortest loop from `start` back to it through `members` only
+    (breadth first, neighbours in name order): [start, ..., start], or []."""
+    parent: dict = {}
+    queue = [start]
+    seen = {start}
+    while queue:
+        nxt = []
+        for node in queue:
+            for child in sorted(graph.get(node, {})):
+                if child not in members:
+                    continue
+                if child == start:
+                    path = [node]
+                    while path[-1] != start:
+                        path.append(parent[path[-1]])
+                    return list(reversed(path)) + [start]
+                if child not in seen:
+                    seen.add(child)
+                    parent[child] = node
+                    nxt.append(child)
+        queue = nxt
+    return []
+
+
+#: Up to this many layers in one group the loop reported is the shortest
+#: of the whole group (a search from every member, O(k * E)); a larger
+#: group gets the shortest loop through its alphabetically first layer.
+EXHAUSTIVE_LOOP_SEARCH = 500
+
+
+def _shortest_cycle(graph: dict, group: "list[str]") -> "list[str]":
+    """The shortest loop in the group, searched from every member (see
+    EXHAUSTIVE_LOOP_SEARCH); among loops of equal length the one whose
+    sequence of names sorts first. It starts and ends at its own
+    alphabetically first layer: [a, b, ..., a]."""
+    members = set(group)
+    best: "list[str]" = []
+    starts = group if len(group) <= EXHAUSTIVE_LOOP_SEARCH else group[:1]
+    for start in starts:
+        loop = _loop_from(graph, members, start)
+        if not loop:
+            continue
+        body = loop[:-1]
+        first = body.index(min(body))
+        loop = body[first:] + body[:first] + [body[first]]
+        if not best or (len(loop), loop) < (len(best), best):
+            best = loop
+    return best
+
+
+def _cycle_violations(rule: rules_mod.Rule, entries: list,
+                      layers: list[dict],
+                      index: "IdentityIndex | None" = None
+                      ) -> "list[Violation]":
+    """One violation per group of layers that depend on each other in a
+    loop: it names the group's shortest loop (_shortest_cycle) and the
+    import behind each step.
+    The file and line are those of the loop's first import; the identity is
+    the loop itself."""
+    graph = _layer_edges(rule, entries, layers, index)
+    out: list[Violation] = []
+    for group in _strongly_connected(graph):
+        if len(group) < 2:
+            continue
+        loop = _shortest_cycle(graph, group)
+        if not loop:
+            continue
+        evidence = []
+        for a, b in zip(loop, loop[1:]):
+            rel, lineno, mod = graph[a][b]
+            evidence.append(f"{a} -> {b}: {rel}:{lineno} imports {mod}")
+        first_file, first_line, _mod = graph[loop[0]][loop[1]]
+        more = len(group) - (len(loop) - 1)
+        detail = "layer cycle " + " -> ".join(loop)
+        if more > 0:
+            others = ", ".join(sorted(set(group) - set(loop)))
+            detail += (f" (and {more} more layer{'' if more == 1 else 's'} "
+                       f"caught in loops with these: {others})")
+        out.append(Violation(rule=rule, file=first_file, line=first_line,
+                             detail=detail, evidence=evidence))
+    return out

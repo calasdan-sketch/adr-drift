@@ -154,7 +154,9 @@ def _check_value(val: str, lineno: int, in_flow: bool = False):
     if c0 == "&":
         raise _err("YAML anchors (&) are not supported", lineno)
     if c0 == "*":
-        raise _err("YAML aliases (*) are not supported", lineno)
+        raise _err("YAML aliases (*) are not supported; a value that "
+                   "starts with '*' must be quoted (- \"forbid-cycles: *\")",
+                   lineno)
     if c0 == "!":
         raise _err("YAML tags (!) are not supported", lineno)
     if c0 in ("|", ">"):

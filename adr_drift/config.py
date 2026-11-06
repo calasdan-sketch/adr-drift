@@ -56,6 +56,82 @@ class Loaded:
     rules: list
     adrs: list
     warnings: list
+    #: ADRs whose status retires them (superseded, deprecated, rejected):
+    #: (display path, status, number of rules NOT enforced).
+    inactive: list = dataclasses.field(default_factory=list)
+
+
+#: The first word of a status that retires an ADR: its constraints are not
+#: enforced any more. adr-tools writes "Superseded by ..."; MADR's statuses
+#: are proposed, rejected, accepted, deprecated and "superseded by ...".
+INACTIVE_STATUSES = frozenset({"superseded", "deprecated", "rejected"})
+
+
+def _status_word(status: str) -> str:
+    """The first word of a status, lower case ("" if it has none)."""
+    m = re.match(r"[^A-Za-z]*([A-Za-z]+)", status or "")
+    return m.group(1).lower() if m else ""
+
+
+def is_inactive_status(status: str) -> bool:
+    """True when `status` (as an ADR spells it: "Superseded by 0005",
+    "**Rejected**", "deprecated.") retires the ADR."""
+    return _status_word(status) in INACTIVE_STATUSES
+
+
+_LINK_TARGET_RE = re.compile(r"\]\(\s*<?([^)\s>]+)")
+_NUMBER_RE = re.compile(r"\d+")
+
+
+def _superseding(status: str, adrs: "list[dict]") -> "dict | None":
+    """The ADR a "Superseded by ..." status names: a Markdown link to its
+    file ("Superseded by [5](0005-x.md)") or its number ("by ADR-0005",
+    "by 5"); None when it names none of `adrs`."""
+    rest = re.sub(r"(?i)^[^A-Za-z]*superseded", "", status)
+    m = _LINK_TARGET_RE.search(rest)
+    if m:
+        target = posixpath.basename(m.group(1).split("#", 1)[0]
+                                    .replace("\\", "/"))
+        for a in adrs:
+            if os.path.basename(a["path"]) == target:
+                return a
+        return None
+    m = _NUMBER_RE.search(rest)
+    if m:
+        for a in adrs:
+            if a["number"] and int(a["number"]) == int(m.group(0)):
+                return a
+    return None
+
+
+def _supersede_problem(adr: dict, adrs: "list[dict]", shown: str) -> str:
+    """Why a superseded ADR may not drop its rules ("" when it may): its
+    status must name an ADR that was read, and following "superseded by"
+    from there must end at an ADR that is in force. Otherwise a status edit
+    alone - pointing nowhere - would switch the rules off."""
+    if _status_word(adr["status"]) != "superseded":
+        return ""  # deprecated / rejected need no successor
+    seen = {adr["path"]}
+    current = adr
+    while _status_word(current["status"]) == "superseded":
+        nxt = _superseding(current["status"], adrs)
+        if nxt is None:
+            return (f"{shown}: status {adr['status']!r} must name the ADR "
+                    "that replaces it, and that ADR must have been read "
+                    "(e.g. 'Superseded by [5](0005-x.md)' or 'Superseded by "
+                    "0005'; pass --adr-dir for ADRs elsewhere): until then "
+                    f"its {len(adr['rules'])} rule(s) cannot be retired")
+        if nxt["path"] in seen:
+            return (f"{shown}: 'superseded by' goes round in a loop; its "
+                    f"{len(adr['rules'])} rule(s) cannot be retired")
+        seen.add(nxt["path"])
+        current = nxt
+    if is_inactive_status(current["status"]):
+        other = os.path.basename(current["path"])
+        return (f"{shown}: superseded by {other}, which is "
+                f"{current['status']!r}, not in force: its "
+                f"{len(adr['rules'])} rule(s) cannot be retired")
+    return ""
 
 
 def _lines(text: str) -> "list[str]":
@@ -255,8 +331,9 @@ def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
                 f"{where}: not a rule: {text!r}"
                 + (f" - {hint}" if hint else
                    " (rules are 'forbid-import: <from> -> <to>', "
-                   "'forbid-pattern: <glob> !~ <regex>' or "
-                   "'require-pattern: <glob> =~ <regex>')"))
+                   "'forbid-pattern: <glob> !~ <regex>', "
+                   "'require-pattern: <glob> =~ <regex>' or "
+                   "'forbid-cycles: <layers>')"))
             continue
         out.append(rule)
     return out
@@ -451,6 +528,51 @@ def _status_line(body: "list[str]") -> str:
     return ""
 
 
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _without_fences(lines: "list[str]") -> "list[str]":
+    """The lines with every fenced code block (``` or ~~~, CommonMark style:
+    closed by a fence of the same character at least as long) blanked out,
+    line numbers preserved. A `## Status` shown as an example inside a code
+    block is not the ADR's status. An unclosed fence runs to the end of the
+    file, as Markdown renders it."""
+    out: "list[str]" = []
+    fence = ""
+    for line in lines:
+        m = _FENCE_RE.match(line)
+        if not fence:
+            if m:
+                fence = m.group(1)
+                out.append("")
+            else:
+                out.append(line)
+            continue
+        out.append("")
+        if (m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+                and not line.strip()[len(m.group(1)):].strip()):
+            fence = ""
+    return out
+
+
+def _front_status(front: "list[str]") -> str:
+    for line in front:
+        m = _FRONT_STATUS_RE.match(line)
+        if m:
+            return _yaml_scalar(m.group(1))
+    return ""
+
+
+def adr_status_sources(lines: "list[str]") -> "tuple[str, str]":
+    """(the status the body gives - a `## Status` section or a `Status:`
+    line -, the status the front matter gives); "" for what is not there.
+    Fenced code blocks are not read."""
+    lines = _without_fences(lines)
+    front, start = _front_matter(lines)
+    body = lines[start:]
+    return (_status_section(body) or _status_line(body)), _front_status(front)
+
+
 def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
     """(title, status) of an ADR given its lines (HTML comments already
     blanked); "" for what is not there.
@@ -459,6 +581,7 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
     inside the front matter is a YAML comment). The status is, in this order,
     the first line of a `## Status` section, the `status:` of the front matter
     (MADR) or a `Status:` line under the title."""
+    lines = _without_fences(lines)
     front, start = _front_matter(lines)
     body = lines[start:]
     title = ""
@@ -467,13 +590,7 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
         if m and m.group(1).strip():
             title = m.group(1).strip()
             break
-    status = _status_section(body)
-    if not status:
-        for line in front:
-            m = _FRONT_STATUS_RE.match(line)
-            if m:
-                status = _yaml_scalar(m.group(1))
-                break
+    status = _status_section(body) or _front_status(front)
     return title, status or _status_line(body)
 
 
@@ -497,6 +614,18 @@ def parse_adr(path: str, display: "str | None" = None,
         info["title"] = m.group(2).replace("-", " ").replace("_", " ")
     lines = _without_html_comments(_lines(text))
     title, status = adr_title_and_status(lines)
+    in_body, in_front = adr_status_sources(lines)
+    if in_body and in_front and _status_word(in_body) != _status_word(
+            in_front):
+        retire = [is_inactive_status(x) for x in (in_body, in_front)]
+        if retire[0] != retire[1]:
+            # One says retired, one says enforced: enforce (fail closed).
+            status = in_body if not retire[0] else in_front
+        info["warnings"].append(
+            f"{shown}: the front matter says status {in_front!r} but the "
+            f"document says {in_body!r}; using {status!r}"
+            + (" (the one that keeps the rules enforced)"
+               if retire[0] != retire[1] else ""))
     info["title"] = title or info["title"]
     info["status"] = status
     if not parse_rules:
@@ -558,10 +687,25 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     if problems:
         raise ConfigError(problems)
     all_rules = list(arch_rules)
+    inactive: "list[tuple[str, str, int]]" = []
     for a in adrs:
-        all_rules.extend(a["rules"])
+        shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+        if is_inactive_status(a["status"]) and a["rules"]:
+            problem = _supersede_problem(a, adrs, shown)
+            if problem:
+                problems.append(problem)
+    if problems:
+        raise ConfigError(problems)
+    for a in adrs:
         warnings.extend(a["warnings"])
-    return Loaded(layers, all_rules, adrs, warnings)
+        if is_inactive_status(a["status"]):
+            # A superseded or rejected decision must not keep failing CI;
+            # its rules were still parsed, so a broken one is still an error.
+            inactive.append((os.path.relpath(a["path"], root).replace(
+                os.sep, "/"), a["status"], len(a["rules"])))
+            continue
+        all_rules.extend(a["rules"])
+    return Loaded(layers, all_rules, adrs, warnings, inactive)
 
 
 def load_all_rules(root: str, adr_dir=None

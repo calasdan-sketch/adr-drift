@@ -214,3 +214,15 @@ def blame_commit_for_line(root: str, rel_path: str, lineno: int) -> str:
         if len(line) >= 40 and all(c in "0123456789abcdef" for c in line[:40]):
             return line[:7]
     return ""
+
+
+def repo_prefix(root: str) -> str:
+    """`root` relative to the top of its git repository, with "/" and no
+    trailing slash ("packages/api"); "" at the top level, outside a git
+    repository or without git. GitHub annotations and SARIF name files from
+    the top of the repository, not from --root."""
+    try:
+        out = _run(root, "rev-parse", "--show-prefix")
+    except GitError:
+        return ""
+    return out.decode("utf-8", "surrogateescape").strip().rstrip("/")
