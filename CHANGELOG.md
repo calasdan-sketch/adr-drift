@@ -55,6 +55,10 @@ Changed
 - The action no longer expands `*` in `args`: the step is now
   [`action.sh`](action.sh), which splits the input into an array with
   `read -a`. `.gitattributes` keeps it LF on Windows checkouts.
+- The source distribution now carries what its own tests need
+  (`MANIFEST.in`: `tests/_support.py`, the fixtures, `action.yml`,
+  `action.sh`, CHANGELOG, LICENSE); before, the CI job that runs the tests
+  from the unpacked sdist could not import its helpers.
 
 ## 0.1.2 and earlier
 

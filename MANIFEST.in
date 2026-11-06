@@ -1,0 +1,7 @@
+# What the source distribution carries besides the package: everything its
+# own test suite needs (CI unpacks the sdist and runs the tests in it).
+include LICENSE README.md CHANGELOG.md
+include action.yml action.sh .pre-commit-hooks.yaml
+recursive-include tests *.py
+recursive-include tests/fixtures *
+global-exclude __pycache__ *.py[cod]
