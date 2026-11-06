@@ -13,7 +13,14 @@ would start a workflow command of its own. So:
   it to everything written to stdout and stderr.
 * github_annotations() escapes workflow-command data and properties as the
   Actions runner expects (%25, %0D, %0A, and in properties also %3A, %2C).
-* sarif_log() is plain json.dumps (ASCII-only output: nothing to escape).
+* sarif_log() is plain json.dumps (ASCII-only output). Text fields go
+  through escape_terminal() too, so a file name that is not valid UTF-8
+  (Python holds it as lone surrogates) becomes a visible \\udcff escape
+  instead of an invalid JSON string; the URI percent-encodes its raw bytes.
+
+Both machine formats name files from the root of the git repository (the
+path that GitHub matches against the pull request), not from --root: the
+caller passes `prefix`, the --root directory relative to that top level.
 """
 
 from __future__ import annotations
@@ -72,10 +79,19 @@ def _gh_property(text: str) -> str:
     return _gh_data(text).replace(":", "%3A").replace(",", "%2C")
 
 
+def _has_surrogates(text: str) -> bool:
+    return any("\ud800" <= c <= "\udfff" for c in text)
+
+
 def gh_command(kind: str, message: str, file: str = "", line: int = 0,
                title: str = "") -> str:
-    """One `::error file=..,line=..,title=..::message` line."""
+    """One `::error file=..,line=..,title=..::message` line. A file name
+    that is not valid UTF-8 cannot be named to the runner: the annotation
+    then has no file (the message still names it, escaped)."""
     props = []
+    if file and _has_surrogates(file):
+        message = f"{escape_terminal(file)}: {message}"
+        file = ""
     if file:
         props.append(f"file={_gh_property(file)}")
         if line and line > 0:
@@ -96,15 +112,32 @@ def violation_message(v) -> str:
     return text
 
 
-def github_annotations(violations, warnings=()) -> "list[str]":
+def _join(prefix: str, path: str) -> str:
+    return (prefix.rstrip("/") + "/" + path) if prefix else path
+
+
+def github_annotations(violations, warnings=(), prefix: str = "",
+                       retired=()) -> "list[str]":
     """Workflow commands: an error annotation on each violation's line, a
-    warning annotation for each warning."""
-    lines = [gh_command("error", violation_message(v), file=v.file,
-                        line=v.line, title=f"adr-drift: {v.rule.kind}")
+    warning annotation for each warning and each retired ADR (on the ADR
+    file: retiring a decision must be as visible as breaking it).
+    `retired` holds (path, status, rule count) as config.Loaded.inactive."""
+    lines = [gh_command("error", violation_message(v),
+                        file=_join(prefix, v.file), line=v.line,
+                        title=f"adr-drift: {v.rule.kind}")
              for v in violations]
     lines.extend(gh_command("warning", w, title="adr-drift")
                  for w in warnings)
+    lines.extend(gh_command("warning", retired_message(path, status, n),
+                            file=_join(prefix, path),
+                            title="adr-drift: ADR retired")
+                 for path, status, n in retired if n)
     return lines
+
+
+def retired_message(path: str, status: str, n: int) -> str:
+    return (f"{path} is {status!r}: its {n} rule{'' if n == 1 else 's'} "
+            f"{'is' if n == 1 else 'are'} not enforced")
 
 
 # -- SARIF 2.1.0 ---------------------------------------------------------------
@@ -112,21 +145,34 @@ def github_annotations(violations, warnings=()) -> "list[str]":
 def rule_id(rule) -> str:
     """A stable id for a rule: its kind and a short hash of what it says, so
     code scanning keeps one alert history per rule across runs."""
-    digest = hashlib.sha256(rule.describe().encode("utf-8")).hexdigest()
-    return f"{rule.kind}/{digest[:12]}"
+    return f"{rule.kind}/{_digest(rule.describe())[:12]}"
 
 
 def _uri(path: str) -> str:
     """A repo-relative path as a relative URI reference ("%" and spaces
-    percent-encoded, "/" kept)."""
-    return urllib.parse.quote(path.replace("\\", "/"), safe="/")
+    percent-encoded, "/" kept). Encoded from the file name's own bytes, so
+    a name that is not valid UTF-8 still names the right file."""
+    raw = path.replace("\\", "/").encode("utf-8", "surrogateescape")
+    return urllib.parse.quote(raw, safe="/")
 
 
-def sarif_log(violations, version: str, identity) -> dict:
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _text(text: str) -> str:
+    """A SARIF text field: nothing that could hide or mislead a reader."""
+    return escape_terminal(text)
+
+
+def sarif_log(violations, version: str, identity, prefix: str = "",
+              retired=()) -> dict:
     """A SARIF 2.1.0 log of `violations`. `identity` is the function that
     says when two violations are the same one (engine.identity): it becomes
     the partial fingerprint, so code scanning tracks an alert across edits
-    above it, as `check --baseline` does."""
+    above it, as `check --baseline` does. `prefix` is the --root directory
+    from the top of the git repository; `retired` (as config.Loaded.inactive)
+    becomes tool notifications of level "warning"."""
     rules: "list[dict]" = []
     index: "dict[str, int]" = {}
     results: "list[dict]" = []
@@ -140,10 +186,10 @@ def sarif_log(violations, version: str, identity) -> dict:
             rules.append({
                 "id": rid,
                 "name": v.rule.kind,
-                "shortDescription": {"text": v.rule.describe()[:1024]},
+                "shortDescription": {"text": _text(v.rule.describe())[:1024]},
                 "fullDescription": {
-                    "text": (f"{v.rule.describe()} - declared in "
-                             f"{source}")[:1024]},
+                    "text": _text(f"{v.rule.describe()} - declared in "
+                                  f"{source}")[:1024]},
                 "helpUri": INFORMATION_URI + "#the-constraint-dsl",
                 "defaultConfiguration": {"level": "error"},
                 "properties": {"tags": ["architecture", "adr"],
@@ -151,15 +197,16 @@ def sarif_log(violations, version: str, identity) -> dict:
             })
         key = "\0".join(str(part) for part in identity(v))
         seen[key] += 1
-        fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        location: dict = {"artifactLocation": {"uri": _uri(v.file)}}
+        fingerprint = _digest(key)
+        location: dict = {"artifactLocation": {"uri": _uri(_join(prefix,
+                                                                 v.file))}}
         if v.line and v.line > 0:
             location["region"] = {"startLine": int(v.line)}
         results.append({
             "ruleId": rid,
             "ruleIndex": index[rid],
             "level": "error",
-            "message": {"text": violation_message(v)},
+            "message": {"text": _text(violation_message(v))},
             "locations": [{"physicalLocation": location}],
             "partialFingerprints": {
                 "adrDriftIdentity/v1": f"{fingerprint}:{seen[key]}"},
@@ -174,10 +221,23 @@ def sarif_log(violations, version: str, identity) -> dict:
                 "informationUri": INFORMATION_URI,
                 "rules": rules,
             }},
+            "invocations": [{
+                "executionSuccessful": True,
+                "toolExecutionNotifications": [
+                    {"level": "warning",
+                     "message": {"text": _text(retired_message(path, status,
+                                                               n))},
+                     "locations": [{"physicalLocation": {
+                         "artifactLocation": {"uri": _uri(_join(prefix,
+                                                                path))}}}]}
+                    for path, status, n in retired if n],
+            }],
             "results": results,
         }],
     }
 
 
-def sarif_text(violations, version: str, identity) -> str:
-    return json.dumps(sarif_log(violations, version, identity), indent=2)
+def sarif_text(violations, version: str, identity, prefix: str = "",
+               retired=()) -> str:
+    return json.dumps(sarif_log(violations, version, identity, prefix,
+                                retired), indent=2)

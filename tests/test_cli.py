@@ -324,27 +324,17 @@ class TestAction(unittest.TestCase):
             data = miniyaml.safe_load(f.read())
         self.assertEqual(data["runs"]["using"], "composite")
         step = data["runs"]["steps"][0]
-        self.assertIn("adr_drift check", step["run"])
+        self.assertEqual(step["run"], 'bash "$GITHUB_ACTION_PATH/action.sh"')
+        with open(os.path.join(os.path.dirname(path), "action.sh"),
+                  encoding="utf-8") as f:
+            self.assertIn("python -m adr_drift check", f.read())
         self.assertEqual(step["shell"], "bash")
-
-    def _check_command(self) -> str:
-        """The action's `adr_drift check ...` command, as action.yml has it."""
-        from adr_drift import miniyaml
-        with open(ACTION_YML, encoding="utf-8") as f:
-            data = miniyaml.safe_load(f.read())
-        run = data["runs"]["steps"][0]["run"]
-        command = run.split("&&")[-1].strip()
-        self.assertEqual(command, "python -m adr_drift check $ADR_DRIFT_ARGS")
-        return command
 
     def test_args_input_after_check_may_hold_adr_dir_and_root(self):
         # The action appends its `args` input after `check`; an option that
         # belongs to the whole tool used to be "unrecognized arguments".
-        command = self._check_command()
         root = adr_in_unusual_place()
-        args = f"--adr-dir doc/decisions --root {root}"
-        argv = command.replace("$ADR_DRIFT_ARGS", args).split()[3:]
-        self.assertEqual(argv[0], "check")
+        argv = ["check", "--adr-dir", "doc/decisions", "--root", root]
         code, out, err = run_main(*argv)
         self.assertEqual(code, 1, out + err)
         self.assertIn("a/x.py", out)
@@ -355,14 +345,20 @@ class TestAction(unittest.TestCase):
                      "see Windows paths; the action runs under Git Bash there")
     @unittest.skipUnless(shutil.which("bash"), "the action's shell is bash")
     def test_the_actions_command_line_in_a_real_shell(self):
-        command = self._check_command().replace(
-            "python -m adr_drift", '"$PYBIN" -m adr_drift')
+        # action.sh with a `python` that skips the pip install and runs this
+        # checkout's adr_drift
         root = adr_in_unusual_place()
+        bindir = tempfile.mkdtemp()
+        with open(os.path.join(bindir, "python"), "w") as f:
+            f.write('#!/bin/sh\n[ "$2" = pip ] && exit 0\n'
+                    f'exec "{sys.executable}" "$@"\n')
+        os.chmod(os.path.join(bindir, "python"), 0o755)
         env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
-        env.update(PYBIN=sys.executable, PYTHONPATH=REPO_ROOT,
+        env.update(PATH=bindir + os.pathsep + env.get("PATH", ""),
+                   PYTHONPATH=REPO_ROOT, GITHUB_ACTION_PATH=REPO_ROOT,
                    ADR_DRIFT_ARGS="--adr-dir doc/decisions --strict")
-        p = subprocess.run(["bash", "-c", command], cwd=root, env=env,
-                           capture_output=True, timeout=120)
+        p = subprocess.run(["bash", os.path.join(REPO_ROOT, "action.sh")],
+                           cwd=root, env=env, capture_output=True, timeout=120)
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn(b"a/x.py", p.stdout)
         self.assertNotIn(b"unrecognized", p.stderr)

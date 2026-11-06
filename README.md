@@ -99,7 +99,9 @@ forbid-cycles: *                          # no two layers depend on each other i
 `<layers>` (`*` for all, `core*`, one name...). A layer depends on another
 when one of its files imports a module of the other (resolved as for
 `forbid-import`). Each group of layers caught in a loop is one violation that
-names the shortest loop and the import behind each step:
+names the group's shortest loop (searched from every layer of the group; in
+a group of more than 500 layers, the shortest loop through its
+alphabetically first layer) and the import behind each step:
 
 ```
   src/a/m.py
@@ -171,7 +173,11 @@ The title is the first `# ` heading (after any front matter). The status is
 the first line of a `## Status` section; else the `status:` of the front
 matter (MADR); else a `Status:` line between the title and the first `##`
 heading (`* Status: accepted`, `**Status:** accepted`). No status shows
-as a dash.
+as a dash. Fenced code blocks (```` ``` ```` or `~~~`) are never read for
+the title or the status, so an example `## Status` inside one is not the
+ADR's status. When the front matter and the document give different
+statuses, that is a warning; if one of them retires the ADR and the other
+does not, the ADR stays in force.
 
 ### Retired ADRs are not enforced
 
@@ -181,9 +187,20 @@ CI. When the first word of an ADR's status is `Superseded`, `Deprecated` or
 `**Rejected**`), its constraints are not enforced, and `check`, `baseline`
 and `drift` say so on stderr:
 `note: docs/adr/0002-old.md is 'Superseded by 0005': its 1 rule is not
-enforced`. Its rules are still parsed - a broken rule is still an error - and
-when every rule comes from a retired ADR, `check` exits 2 as for no rules at
-all. Every other status (`Proposed`, `Accepted`, none) is enforced.
+enforced`. With `--format github` that is a `::warning` annotation on the
+ADR file, and in SARIF a tool notification of level `warning`: retiring a
+decision is as visible on the pull request as breaking it. Its rules are
+still parsed - a broken rule is still an error - and when every rule comes
+from a retired ADR, `check` exits 2 as for no rules at all. Every other
+status (`Proposed`, `Accepted`, none) is enforced.
+
+A `Superseded` ADR with rules must say what replaced it, and that must be in
+force: its status names an ADR that was read, by a Markdown link to the file
+(`Superseded by [5](0005-use-kafka.md)`) or by number (`Superseded by 0005`,
+`by ADR-5`), and following "superseded by" from there ends at an ADR that is
+not superseded, deprecated or rejected. Otherwise - no successor named, one
+that was not read, a retired one, a loop - it is an error (exit 2) and the
+rules stay. `Deprecated` and `Rejected` need no successor.
 
 ### Rules are strict: nothing is dropped silently
 
@@ -306,7 +323,17 @@ are printed as visible escapes (`\x1b`, `\u202e`), so a file name cannot
 rewrite your terminal or make a line read differently from what it is. In
 annotations, newlines and `%` are escaped as the Actions runner expects, so a
 message cannot start a workflow command of its own. JSON and SARIF are
-ASCII-only.
+ASCII-only; a file name that is not valid UTF-8 is percent-encoded from its
+bytes in a SARIF URI, and named (escaped) in the message of a GitHub
+annotation that then has no file. A report that cannot be written at all is
+an `error:` and exit 2, with nothing on stdout.
+
+GitHub annotations and SARIF name files from the top of the git repository,
+because that is what GitHub matches against the pull request: with
+`--root packages/api` a violation in `src/x.py` is reported as
+`packages/api/src/x.py` (found with `git rev-parse --show-prefix`; outside a
+git repository nothing is added). `human` and `json` keep naming files from
+`--root`.
 
 Warnings flag rules and layers that cover nothing, which usually means a typo:
 a layer whose paths match no scanned source file, a `forbid-pattern` or
@@ -335,7 +362,9 @@ Or use the bundled composite action (needs Python on the runner):
 
 The action runs `python -m adr_drift check <args>`, so `args` takes anything
 `check` takes, including `--root` and `--adr-dir` (they are accepted after the
-command name). The text is split on spaces without any quoting, so a path
+command name). The step ([`action.sh`](action.sh)) gets the text through the
+environment and splits it on whitespace into separate arguments, with no
+quoting and no wildcard expansion (`*` reaches adr-drift as `*`), so a path
 with a space in it cannot be passed.
 
 Annotations on the pull request's lines: `args: --format github`.

@@ -142,3 +142,75 @@ class DriftTest(GitCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PanelFindingsTest(unittest.TestCase):
+    """Regressions for the synapse-1 panel review."""
+
+    def test_reports_the_shortest_loop_of_the_whole_group(self):
+        # a->b->c->d->a plus c->b: the 2-step b->c->b is the shortest
+        graph = {"a": {"b": ()}, "b": {"c": ()}, "c": {"d": (), "b": ()},
+                 "d": {"a": ()}}
+        group = engine._strongly_connected(graph)[0]
+        self.assertEqual(engine._shortest_cycle(graph, group),
+                         ["b", "c", "b"])
+
+    def test_shortest_loop_matches_brute_force(self):
+        import itertools
+        import random
+        rng = random.Random(7)
+        for _ in range(300):
+            names = [chr(97 + i) for i in range(rng.randint(2, 6))]
+            graph = {n: {m: () for m in names
+                         if m != n and rng.random() < 0.35} for n in names}
+            for group in engine._strongly_connected(graph):
+                if len(group) < 2:
+                    continue
+                best = None
+                for size in range(2, len(group) + 1):
+                    for perm in itertools.permutations(group, size):
+                        if all(perm[(i + 1) % size] in graph[perm[i]]
+                               for i in range(size)):
+                            best = size
+                            break
+                    if best:
+                        break
+                loop = engine._shortest_cycle(graph, group)
+                self.assertEqual(len(loop) - 1, best, (graph, group, loop))
+
+    def test_identity_index_matches_the_reference(self):
+        import random
+        rng = random.Random(3)
+        words = ["src", "app", "db", "core", "a.b", "web", "lib"]
+        for _ in range(300):
+            layers = []
+            for i in range(rng.randint(0, 5)):
+                path = "/".join(rng.choice(words)
+                                for _ in range(rng.randint(1, 3)))
+                tail = rng.choice(["/**", "/*", "", "/**/x*"])
+                layers.append({"name": rng.choice(words + [f"L{i}", ""]),
+                               "paths": [path + tail]})
+            index = engine.IdentityIndex(layers)
+            for _ in range(10):
+                sep = rng.choice([".", "/"])
+                mod = sep.join(rng.choice(words)
+                               for _ in range(rng.randint(1, 4)))
+                self.assertEqual(index.of(mod),
+                                 engine._import_identities(mod, layers),
+                                 (mod, layers))
+
+    def test_many_layers_is_not_quadratic(self):
+        import time
+        def run(n):
+            layers = [{"name": f"l{i}", "paths": [f"src/l{i}/**"]}
+                      for i in range(n)]
+            entries = [(f"src/l{i}/m.py", f"l{i}",
+                        [(f"l{(i + 1) % n}.m", 1)], "") for i in range(n)]
+            r = rules.parse_rule_line("forbid-cycles: *")
+            t = time.perf_counter()
+            found = engine.evaluate(entries, layers, [r])
+            self.assertEqual(len(found), 1)
+            return time.perf_counter() - t
+        small, big = run(250), run(2000)
+        # 8x the layers: quadratic would be ~64x; allow generous noise
+        self.assertLess(big, small * 30 + 0.5)

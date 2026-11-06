@@ -156,6 +156,7 @@ class InactiveAdrTest(unittest.TestCase):
         files = dict(BAD)
         files["src/handlers/h.py"] = "import os\n"
         files["docs/adr/0002-old.md"] = self.adr("Superseded by 0003")
+        files["docs/adr/0003-new.md"] = "# 3: New\n\n## Status\n\nAccepted\n"
         code, out, err = run_main("--root", make_repo(files), "check")
         self.assertEqual(code, 0, out)
         self.assertIn("note: docs/adr/0002-old.md is 'Superseded by 0003': "
@@ -187,3 +188,188 @@ class InactiveAdrTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- regressions for the synapse-1 panel review --------------------------------
+
+import os  # noqa: E402
+import shutil  # noqa: E402
+
+from _support import GitCase, init_git, write_files  # noqa: E402
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class MonorepoPathsTest(GitCase):
+    """--root inside a repository: GitHub and SARIF name files from the top
+    of the repository, where the pull request's lines are."""
+
+    def repo(self):
+        top = init_git(make_repo({}))
+        write_files(top, {f"packages/api/{k}": v for k, v in BAD.items()})
+        return top, os.path.join(top, "packages", "api")
+
+    def test_github_paths_start_at_the_repo_top(self):
+        _top, root = self.repo()
+        code, out, _err = run_main("--root", root, "check", "--format",
+                                   "github")
+        self.assertEqual(code, 1)
+        self.assertIn("::error file=packages/api/src/handlers/h.py,line=2,",
+                      out)
+
+    def test_sarif_paths_start_at_the_repo_top(self):
+        _top, root = self.repo()
+        _code, out, _err = run_main("--root", root, "check", "--format",
+                                    "sarif")
+        uri = (json.loads(out)["runs"][0]["results"][0]["locations"][0]
+               ["physicalLocation"]["artifactLocation"]["uri"])
+        self.assertEqual(uri, "packages/api/src/handlers/h.py")
+
+    def test_json_and_human_keep_root_relative_paths(self):
+        _top, root = self.repo()
+        _code, out, _err = run_main("--root", root, "check", "--format",
+                                    "json")
+        self.assertEqual(json.loads(out)[0]["file"], "src/handlers/h.py")
+
+    def test_outside_git_there_is_no_prefix(self):
+        _code, out, _err = run_main("--root", make_repo(BAD), "check",
+                                    "--format", "github")
+        self.assertIn("::error file=src/handlers/h.py,", out)
+
+
+class RetirementVisibilityTest(unittest.TestCase):
+    OLD = ("# 2: Old\n\n## Status\n\n{status}\n\n## Constraints\n\n"
+           "- forbid-pattern: src/** !~ import os\n")
+    NEW = "# 3: New\n\n## Status\n\nAccepted\n"
+
+    def files(self, status, new=NEW):
+        files = dict(BAD)
+        files["src/handlers/h.py"] = "import os\n"
+        files["docs/adr/0002-old.md"] = self.OLD.format(status=status)
+        if new is not None:
+            files["docs/adr/0003-new.md"] = new
+        return files
+
+    def test_github_warns_on_the_retired_adr(self):
+        code, out, _err = run_main("--root", make_repo(self.files(
+            "Superseded by [3](0003-new.md)")), "check", "--format", "github")
+        self.assertEqual(code, 0)
+        self.assertIn("::warning file=docs/adr/0002-old.md,title=adr-drift%3A "
+                      "ADR retired::", out)
+
+    def test_sarif_carries_a_notification(self):
+        _code, out, _err = run_main("--root", make_repo(self.files(
+            "Deprecated")), "check", "--format", "sarif")
+        notes = (json.loads(out)["runs"][0]["invocations"][0]
+                 ["toolExecutionNotifications"])
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["level"], "warning")
+        self.assertIn("not enforced", notes[0]["message"]["text"])
+
+    def test_superseded_without_a_successor_fails(self):
+        for status in ("Superseded", "Superseded by 0009",
+                       "Superseded by [9](0009-gone.md)"):
+            with self.subTest(status=status):
+                code, _out, err = run_main("--root", make_repo(self.files(
+                    status)), "check")
+                self.assertEqual(code, 2)
+                self.assertIn("must name the ADR that replaces it", err)
+
+    def test_successor_must_be_in_force(self):
+        code, _out, err = run_main("--root", make_repo(self.files(
+            "Superseded by 0003", new="# 3: New\n\n## Status\n\nRejected\n")),
+            "check")
+        self.assertEqual(code, 2)
+        self.assertIn("not in force", err)
+
+    def test_supersede_chain_and_loop(self):
+        files = self.files("Superseded by 0003",
+                           new="# 3: New\n\n## Status\n\nSuperseded by 4\n")
+        files["docs/adr/0004-newer.md"] = "# 4\n\n## Status\n\nAccepted\n"
+        self.assertEqual(run_main("--root", make_repo(files), "check")[0], 0)
+        files["docs/adr/0004-newer.md"] = ("# 4\n\n## Status\n\n"
+                                           "Superseded by 0002\n")
+        code, _out, err = run_main("--root", make_repo(files), "check")
+        self.assertEqual(code, 2)
+        self.assertIn("loop", err)
+
+    def test_successor_by_number_with_prefix(self):
+        code, _out, _err = run_main("--root", make_repo(self.files(
+            "Superseded by ADR-0003")), "check")
+        self.assertEqual(code, 0)
+
+
+class StatusSpoofTest(unittest.TestCase):
+    RULE = "\n## Constraints\n\n- forbid-pattern: src/** !~ import os\n"
+
+    def check(self, adr):
+        files = dict(BAD)
+        files["src/handlers/h.py"] = "import os\n"
+        files["docs/adr/0002-x.md"] = adr
+        return run_main("--root", make_repo(files), "check")
+
+    def test_status_in_a_fenced_block_is_ignored(self):
+        adr = ("---\nstatus: accepted\n---\n\n# 2: X\n\nAn example:\n\n"
+               "```markdown\n## Status\n\nSuperseded by 0001\n```\n" + self.RULE)
+        code, out, err = self.check(adr)
+        self.assertEqual(code, 1, err)          # still enforced
+        self.assertNotIn("not enforced", err)
+        self.assertIn("must not contain", out)
+
+    def test_tilde_fence_and_longer_closer(self):
+        adr = ("# 2: X\n\n~~~~\n## Status\n\nRejected\n~~~~~\n\n"
+               "## Status\n\nAccepted\n" + self.RULE)
+        self.assertEqual(self.check(adr)[0], 1)
+
+    def test_front_matter_disagreeing_is_flagged_and_enforced(self):
+        adr = ("---\nstatus: accepted\n---\n\n# 2: X\n\n## Status\n\n"
+               "Rejected\n" + self.RULE)
+        code, _out, err = self.check(adr)
+        self.assertEqual(code, 1)               # the rule stays in force
+        self.assertIn("the front matter says status 'accepted' but the "
+                      "document says 'Rejected'", err)
+
+    def test_agreeing_sources_are_quiet(self):
+        adr = ("---\nstatus: rejected\n---\n\n# 2: X\n\n## Status\n\n"
+               "Rejected\n" + self.RULE)
+        code, _out, err = self.check(adr)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("front matter says", err)
+
+
+@unittest.skipIf(os.name == "nt" or os.uname().sysname == "Darwin",
+                 "needs a file system that stores non-UTF-8 names")
+class NonUtf8NameTest(unittest.TestCase):
+    def repo(self):
+        root = make_repo(BAD)
+        name = os.path.join(os.fsencode(root), b"src", b"handlers", b"\xff.py")
+        with open(name, "wb") as f:
+            f.write(b"from db import conn\n")
+        return root
+
+    def test_sarif_does_not_crash(self):
+        code, out, err = run_main("--root", self.repo(), "check", "--format",
+                                  "sarif")
+        self.assertEqual(code, 1, err)
+        uris = [r["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"] for r in json.loads(out)["runs"][0]["results"]]
+        self.assertIn("src/handlers/%FF.py", uris)
+        out.encode("ascii")  # nothing but ASCII
+
+    def test_github_names_the_file_in_the_message_instead(self):
+        code, out, _err = run_main("--root", self.repo(), "check", "--format",
+                                   "github")
+        self.assertEqual(code, 1)
+        bad = [l for l in out.splitlines() if "\\udcff" in l]
+        self.assertTrue(bad)
+        self.assertTrue(all("file=" not in l for l in bad), bad)
+
+    def test_a_report_error_exits_2(self):
+        from unittest import mock
+        with mock.patch("adr_drift.report.sarif_text",
+                        side_effect=UnicodeEncodeError("utf-8", "x", 0, 1,
+                                                       "boom")):
+            code, out, err = run_main("--root", self.repo(), "check",
+                                      "--format", "sarif")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("cannot write the sarif report", err)
+

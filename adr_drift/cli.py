@@ -250,17 +250,18 @@ def _announce_inactive(loaded) -> None:
     a rule that stops being enforced must never do so in silence."""
     for path, status, n in loaded.inactive:
         if n:
-            print(f"note: {path} is {status!r}: its {n} "
-                  f"rule{'' if n == 1 else 's'} {'is' if n == 1 else 'are'} "
-                  "not enforced", file=sys.stderr)
+            print(f"note: {report_mod.retired_message(path, status, n)}",
+                  file=sys.stderr)
 
 
-def _empty_report(fmt: str) -> None:
+def _empty_report(fmt: str, root: str = "", retired=()) -> None:
     """What stdout says for "nothing to report" in a machine format."""
     if fmt == "json":
         print("[]")
     elif fmt == "sarif":
-        print(report_mod.sarif_text([], VERSION, engine_mod.identity))
+        print(report_mod.sarif_text(
+            [], VERSION, engine_mod.identity,
+            githelp.repo_prefix(root) if root else "", retired))
 
 
 def _no_rules_message() -> str:
@@ -282,7 +283,7 @@ def _nothing_to_enforce(args) -> int:
               "adr-drift gradually.", file=sys.stderr)
         return 2
     if getattr(args, "format", "human") in ("json", "sarif"):
-        _empty_report(args.format)
+        _empty_report(args.format, getattr(args, "root", ""))
         print(message, file=sys.stderr)
     else:
         print(message)
@@ -307,25 +308,42 @@ def _adrs_read(n: int) -> str:
     return f"{n} ADR{'' if n == 1 else 's'} read"
 
 
-def _print_machine(violations, fmt: str, diag) -> bool:
-    """Print `violations` in a machine format -> False for "human"."""
-    if fmt == "json":
-        print(json.dumps([v.as_dict() for v in violations], indent=2))
-    elif fmt == "sarif":
-        print(report_mod.sarif_text(violations, VERSION, engine_mod.identity))
-    elif fmt == "github":
-        for line in report_mod.github_annotations(violations,
-                                                  diag.warnings):
-            print(line)
-    else:
+class ReportError(Exception):
+    """The report could not be written (exit 2, never a traceback)."""
+
+
+def _print_machine(violations, fmt: str, diag, root: str = "",
+                   retired=()) -> bool:
+    """Print `violations` in a machine format -> False for "human".
+
+    GitHub annotations and SARIF name files from the top of the git
+    repository, so --root DIR inside it is put in front of every path.
+    Everything is built before anything is printed: a report that cannot be
+    built raises ReportError and stdout stays empty."""
+    if fmt not in ("json", "sarif", "github"):
         return False
+    prefix = githelp.repo_prefix(root) if root and fmt != "json" else ""
+    try:
+        if fmt == "json":
+            text = json.dumps([v.as_dict() for v in violations], indent=2)
+        elif fmt == "sarif":
+            text = report_mod.sarif_text(violations, VERSION,
+                                         engine_mod.identity, prefix,
+                                         retired)
+        else:
+            text = "\n".join(report_mod.github_annotations(
+                violations, diag.warnings, prefix, retired))
+    except (UnicodeError, ValueError, TypeError) as e:
+        raise ReportError(f"cannot write the {fmt} report: {e}") from None
+    if text:
+        print(text)
     return True
 
 
 def _print_violations(violations, fmt: str, adr_count: int,
-                      diag=None) -> None:
+                      diag=None, root: str = "", retired=()) -> None:
     diag = diag if diag is not None else diag_mod.Diagnostics(echo=False)
-    if _print_machine(violations, fmt, diag) and fmt != "github":
+    if _print_machine(violations, fmt, diag, root, retired) and fmt != "github":
         return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
@@ -370,7 +388,12 @@ def cmd_check(args) -> int:
                                   diag=diag)
     if entries is not None:
         violations = engine_mod.not_baselined(violations, entries)
-    _print_violations(violations, args.format, len(loaded.adrs), diag)
+    try:
+        _print_violations(violations, args.format, len(loaded.adrs), diag,
+                          root, loaded.inactive)
+    except ReportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return _verdict(args, violations, diag)
 
 
@@ -488,9 +511,11 @@ def cmd_drift(args) -> int:
         return _git_failed(e)
     if not changed:
         if args.format in ("json", "sarif"):
-            _empty_report(args.format)
+            _empty_report(args.format, root, loaded.inactive)
         elif args.format == "github":
-            for line in report_mod.github_annotations([], diag.warnings):
+            for line in report_mod.github_annotations(
+                    [], diag.warnings, githelp.repo_prefix(root),
+                    loaded.inactive):
                 print(line)
             print(f"no source files changed since {args.since} -- no drift")
         else:
@@ -525,7 +550,13 @@ def cmd_drift(args) -> int:
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
 
-    if _print_machine(new_violations, args.format, diag):
+    try:
+        machine = _print_machine(new_violations, args.format, diag, root,
+                                 loaded.inactive)
+    except ReportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if machine:
         # Stable contract: the JSON list (and the SARIF results, and the
         # annotations) are the NEW violations, as before. Fixed violations
         # are reported in the human output.

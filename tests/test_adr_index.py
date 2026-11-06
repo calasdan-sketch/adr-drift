@@ -358,8 +358,14 @@ class TestStatusAndTitle(unittest.TestCase):
     def test_a_status_heading_still_comes_first(self):
         text = "# T\n\nStatus: draft\n\n## Status\n\nAccepted\n\n## Context\n"
         self.assertEqual(meta(text)[1], "Accepted")
+        # The heading also beats front matter that agrees it is in force ...
+        text = MADR4.replace("## Context and", "## Status\n\nProposed\n\n## Context and")
+        self.assertEqual(meta(text)[1], "Proposed")
+        # ... but when one retires the ADR and the other does not, the ADR
+        # stays in force (0.2.0: a status must not be spoofable; see
+        # test_output_safety.StatusSpoofTest)
         text = MADR4.replace("## Context and", "## Status\n\nDeprecated\n\n## Context and")
-        self.assertEqual(meta(text)[1], "Deprecated")
+        self.assertEqual(meta(text)[1], "accepted")
 
     def test_an_empty_status_section_does_not_swallow_the_next_heading(self):
         text = "# T\n\n## Status\n\n## Context\n\nSome words.\n"

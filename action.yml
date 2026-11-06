@@ -2,7 +2,7 @@ name: adr-drift
 description: Fail the job when code drifts from arch.yaml and ADR constraints.
 inputs:
   args:
-    description: Extra arguments for `adr-drift check` (e.g. --format github, --adr-dir doc/adr, --root packages/api, --baseline .adr-baseline.json, --strict, --allow-empty). Split on spaces, no quoting.
+    description: Extra arguments for `adr-drift check` (e.g. --format github, --adr-dir doc/adr, --root packages/api, --baseline .adr-baseline.json, --strict, --allow-empty). Split on whitespace (spaces and newlines); no quoting and no wildcard expansion, so a path with a space in it cannot be passed.
     required: false
     default: ""
 runs:
@@ -11,4 +11,4 @@ runs:
     - shell: bash
       env:
         ADR_DRIFT_ARGS: ${{ inputs.args }}
-      run: python -m pip install --quiet "$GITHUB_ACTION_PATH" && python -m adr_drift check $ADR_DRIFT_ARGS
+      run: bash "$GITHUB_ACTION_PATH/action.sh"
