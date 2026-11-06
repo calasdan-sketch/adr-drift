@@ -56,6 +56,22 @@ class Loaded:
     rules: list
     adrs: list
     warnings: list
+    #: ADRs whose status retires them (superseded, deprecated, rejected):
+    #: (display path, status, number of rules NOT enforced).
+    inactive: list = dataclasses.field(default_factory=list)
+
+
+#: The first word of a status that retires an ADR: its constraints are not
+#: enforced any more. adr-tools writes "Superseded by ..."; MADR's statuses
+#: are proposed, rejected, accepted, deprecated and "superseded by ...".
+INACTIVE_STATUSES = frozenset({"superseded", "deprecated", "rejected"})
+
+
+def is_inactive_status(status: str) -> bool:
+    """True when `status` (as an ADR spells it: "Superseded by 0005",
+    "**Rejected**", "deprecated.") retires the ADR."""
+    m = re.match(r"[^A-Za-z]*([A-Za-z]+)", status or "")
+    return bool(m) and m.group(1).lower() in INACTIVE_STATUSES
 
 
 def _lines(text: str) -> "list[str]":
@@ -255,8 +271,9 @@ def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
                 f"{where}: not a rule: {text!r}"
                 + (f" - {hint}" if hint else
                    " (rules are 'forbid-import: <from> -> <to>', "
-                   "'forbid-pattern: <glob> !~ <regex>' or "
-                   "'require-pattern: <glob> =~ <regex>')"))
+                   "'forbid-pattern: <glob> !~ <regex>', "
+                   "'require-pattern: <glob> =~ <regex>' or "
+                   "'forbid-cycles: <layers>')"))
             continue
         out.append(rule)
     return out
@@ -558,10 +575,17 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     if problems:
         raise ConfigError(problems)
     all_rules = list(arch_rules)
+    inactive: "list[tuple[str, str, int]]" = []
     for a in adrs:
-        all_rules.extend(a["rules"])
         warnings.extend(a["warnings"])
-    return Loaded(layers, all_rules, adrs, warnings)
+        if is_inactive_status(a["status"]):
+            # A superseded or rejected decision must not keep failing CI;
+            # its rules were still parsed, so a broken one is still an error.
+            inactive.append((os.path.relpath(a["path"], root).replace(
+                os.sep, "/"), a["status"], len(a["rules"])))
+            continue
+        all_rules.extend(a["rules"])
+    return Loaded(layers, all_rules, adrs, warnings, inactive)
 
 
 def load_all_rules(root: str, adr_dir=None

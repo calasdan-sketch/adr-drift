@@ -5,6 +5,8 @@ A rule is one line:
     forbid-import: <from> -> <to>        # layer/module <from> may not import <to>
     forbid-pattern: <glob> !~ <regex>    # files matching <glob> must not contain <regex>
     require-pattern: <glob> =~ <regex>   # files matching <glob> must contain <regex>
+    forbid-cycles: <layers>              # the layers matching <layers> must not
+                                         # depend on each other in a loop
 
 <from>/<to> match against layer names or module prefixes ("db.drivers",
 "src/handlers"). "*" is a wildcard. Comments start with "#".
@@ -18,16 +20,18 @@ import fnmatch
 import re
 
 #: The rule names the DSL knows.
-KINDS = ("forbid-import", "forbid-pattern", "require-pattern")
+KINDS = ("forbid-import", "forbid-pattern", "require-pattern",
+         "forbid-cycles")
 
 
 @dataclasses.dataclass
 class Rule:
     kind: str            # forbid-import | forbid-pattern | require-pattern
+    #                      | forbid-cycles
     source: str          # "arch.yaml" or "docs/adr/0004-....md"
     line_no: int = 0
     raw: str = ""
-    # forbid-import
+    # forbid-import (and forbid-cycles: the layer pattern is from_pat)
     from_pat: str = ""
     to_pat: str = ""
     # pattern rules
@@ -39,6 +43,8 @@ class Rule:
             return f"{self.from_pat} must not import {self.to_pat}"
         if self.kind == "forbid-pattern":
             return f"{self.glob} must not contain /{self.regex}/"
+        if self.kind == "forbid-cycles":
+            return f"layers {self.from_pat} must not depend on each other in a cycle"
         return f"{self.glob} must contain /{self.regex}/"
 
     def where(self) -> str:
@@ -49,7 +55,7 @@ class Rule:
 # The text is stripped before it is matched, so no \s*$ is needed after the
 # rest (a lazy group followed by \s*$ is quadratic on a long run of blanks).
 _RULE_RE = re.compile(
-    r"^(forbid-import|forbid-pattern|require-pattern)\s*:\s*(.+)$")
+    r"^(forbid-import|forbid-pattern|require-pattern|forbid-cycles)\s*:\s*(.+)$")
 
 
 def parse_rule_line(line: str, source: str = "",
@@ -81,6 +87,14 @@ def parse_rule_line(line: str, source: str = "",
                     f"bad forbid-import rule: {line.strip()!r} ({side!r} "
                     "contains spaces; each side is one layer name or module "
                     "prefix - put explanations after a '#')")
+    elif kind == "forbid-cycles":
+        pat = rest.strip()
+        if re.search(r"\s", pat):
+            raise ValueError(
+                f"bad forbid-cycles rule: {line.strip()!r} (want one layer "
+                "name or pattern, like 'forbid-cycles: *' - put "
+                "explanations after a '#')")
+        rule.from_pat = pat
     else:
         op = "!~" if kind == "forbid-pattern" else "=~"
         if op not in rest:
@@ -105,10 +119,10 @@ _TASK_RE = re.compile(r"^\[[ xX]\]\s+")
 _EMPHASIS_RE = re.compile(r"^(\*\*|__)(.*?)\1")
 _HEAD_WORD_RE = re.compile(r"^([A-Za-z][A-Za-z_ -]{2,40}?)\s*:")
 _KEYWORD_INSIDE_RE = re.compile(
-    r"(?<![\w-])(?:forbid|require)[-_ ]?(?:import|pattern)s?\s*:", re.I)
+    r"(?<![\w-])(?:forbid|require)[-_ ]?(?:import|pattern|cycle)s?\s*:", re.I)
 _BARE_ARROW_RE = re.compile(r"^[\w.*/-]+\s*->\s*[\w.*/-]+$")
 _NAME_NO_COLON_RE = re.compile(
-    r"^(?:forbid-import|forbid-pattern|require-pattern)\s")
+    r"^(?:forbid-import|forbid-pattern|require-pattern|forbid-cycles)\s")
 
 
 def clean_rule_text(line: str) -> "tuple[str, bool]":

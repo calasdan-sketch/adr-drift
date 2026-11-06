@@ -1,0 +1,9 @@
+# pre-commit hook: runs `adr-drift check` on the whole repository (rules can
+# span files, so it never runs on the changed files alone).
+- id: adr-drift
+  name: adr-drift check
+  description: Fail when code drifts from arch.yaml and the ADRs' constraints.
+  entry: adr-drift check
+  language: python
+  pass_filenames: false
+  always_run: true

@@ -1,8 +1,38 @@
 # ADR Drift
 
-Deterministic architecture tests for any language. ADRs rot the moment they
-merge — this keeps them mechanically true. Define layers and constraints once,
-then `adr-drift check` fails CI when code drifts from the decisions.
+**Your architecture decisions, checked on every pull request.** Write the
+rule in the ADR itself (`forbid-import: handlers -> db`), and `adr-drift
+check` fails CI when code drifts from it - in Python, JS/TS, Go, Rust, Java,
+Ruby and PHP, with no dependencies beyond the Python standard library.
+
+- Rules live in your ADRs (`## Constraints`) or in `arch.yaml`; a superseded,
+  deprecated or rejected ADR stops being enforced, and says so.
+- Layer imports, forbidden or required code patterns, and dependency cycles
+  between layers.
+- Fails closed: a rule that does not parse, a glob that matches nothing or a
+  repo with no rules is an error or a warning, never a silent pass.
+- Grandfather legacy violations (`baseline`), or check only what a pull
+  request introduced (`drift`).
+- CI-native output: GitHub annotations on the offending line
+  (`--format github`), SARIF for code scanning (`--format sarif`), JSON.
+
+```console
+$ adr-drift --root tests/fixtures/shop check      # the example repo in this repository
+✗ 4 architecture violation(s):
+
+  src/handlers/orders.py
+    src/handlers/orders.py: missing /authenticate\(/
+      rule: src/handlers/**.py must contain /authenticate\(/ (docs/adr/0001-layered-architecture.md)
+    src/handlers/orders.py:1: imports db.drivers
+      rule: handlers must not import db.drivers (arch.yaml)
+    src/handlers/orders.py:1: imports db.drivers
+      rule: handlers must not import db.drivers (docs/adr/0001-layered-architecture.md)
+  src/util.py
+    src/util.py:2: matches /\beval\(/
+      rule: src/**.py must not contain /\beval\(/ (docs/adr/0002-no-dynamic-eval.md)
+$ echo $?
+1
+```
 
 ## The problem
 
@@ -16,10 +46,15 @@ PHP-only. ADR Drift is language-agnostic, repo-local, and CI-friendly.
 ## Install
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/adr-drift   # provides `adr-drift`
+pip install adr-drift                                          # the released version
+pip install git+https://github.com/calasdan-sketch/adr-drift   # the latest code
 ```
 
-Or run without installing: `python3 -m adr_drift` from the repo root.
+Either provides `adr-drift`; Python 3.10+ and nothing else. Or run without
+installing: `python3 -m adr_drift` from the repo root. This README describes
+0.2.0, which is not on PyPI yet (see [CHANGELOG.md](CHANGELOG.md)): until it
+is, `forbid-cycles`, `--format github|sarif` and retired ADRs need the
+second line.
 
 ## Quick start
 
@@ -57,7 +92,27 @@ Rules live in `arch.yaml` and in any ADR's `## Constraints` section:
 forbid-import: handlers -> db.drivers     # layering: handlers may not import drivers
 forbid-pattern: src/**.py !~ \beval\(     # no eval() anywhere in src/
 require-pattern: src/handlers/**.py =~ authenticate\(   # handlers must authenticate
+forbid-cycles: *                          # no two layers depend on each other in a loop
 ```
+
+`forbid-cycles: <layers>` covers the layers of `arch.yaml` whose name matches
+`<layers>` (`*` for all, `core*`, one name...). A layer depends on another
+when one of its files imports a module of the other (resolved as for
+`forbid-import`). Each group of layers caught in a loop is one violation that
+names the shortest loop and the import behind each step:
+
+```
+  src/a/m.py
+    src/a/m.py:1: layer cycle a -> b -> c -> a
+      a -> b: src/a/m.py:1 imports src.b
+      b -> c: src/b/x.py:1 imports src.c.y
+      c -> a: src/c/y.py:1 imports src.a
+      rule: layers * must not depend on each other in a cycle (arch.yaml)
+```
+
+In `arch.yaml` quote it (`- "forbid-cycles: *"`): unquoted, YAML reads `*` as
+an alias and adr-drift says so. A pattern that covers fewer than two layers
+is a warning.
 
 `from`/`to` match layer names or module prefixes (`db.drivers` matches
 `db.drivers.pg`); `*` wildcards supported. Comments start with `#`.
@@ -117,6 +172,18 @@ the first line of a `## Status` section; else the `status:` of the front
 matter (MADR); else a `Status:` line between the title and the first `##`
 heading (`* Status: accepted`, `**Status:** accepted`). No status shows
 as a dash.
+
+### Retired ADRs are not enforced
+
+A decision that was superseded, deprecated or rejected must not keep failing
+CI. When the first word of an ADR's status is `Superseded`, `Deprecated` or
+`Rejected` (any case, any Markdown around it: `Superseded by [5](0005-x.md)`,
+`**Rejected**`), its constraints are not enforced, and `check`, `baseline`
+and `drift` say so on stderr:
+`note: docs/adr/0002-old.md is 'Superseded by 0005': its 1 rule is not
+enforced`. Its rules are still parsed - a broken rule is still an error - and
+when every rule comes from a retired ADR, `check` exits 2 as for no rules at
+all. Every other status (`Proposed`, `Accepted`, none) is enforced.
 
 ### Rules are strict: nothing is dropped silently
 
@@ -225,6 +292,22 @@ array of violations (`[]` when clean) - or empty when the exit code is 2 -
 so `adr-drift check --format json | jq` never meets prose. Every warning and
 error goes to stderr as `warning: ...` / `error: ...`.
 
+| `--format` | stdout |
+|---|---|
+| `human` (default) | the report above |
+| `json` | a bare JSON array; each item has `rule`, `rule_source`, `file`, `line`, `detail` (and `evidence` for a cycle) |
+| `github` | one GitHub Actions `::error` annotation per violation (on its file and line) and one `::warning` per warning, then the human report |
+| `sarif` | a SARIF 2.1.0 log for GitHub code scanning; each rule gets a stable id, each result a fingerprint that ignores the line number (the same identity `check --baseline` uses) |
+
+Everything printed for people - paths, module names, ADR statuses - comes
+from the repository being checked, so it is not trusted: control characters,
+terminal escape sequences, bidi overrides (U+202E) and zero-width characters
+are printed as visible escapes (`\x1b`, `\u202e`), so a file name cannot
+rewrite your terminal or make a line read differently from what it is. In
+annotations, newlines and `%` are escaped as the Actions runner expects, so a
+message cannot start a workflow command of its own. JSON and SARIF are
+ASCII-only.
+
 Warnings flag rules and layers that cover nothing, which usually means a typo:
 a layer whose paths match no scanned source file, a `forbid-pattern` or
 `require-pattern` glob that matches no scanned file, the `from` side of a
@@ -255,6 +338,34 @@ The action runs `python -m adr_drift check <args>`, so `args` takes anything
 command name). The text is split on spaces without any quoting, so a path
 with a space in it cannot be passed.
 
+Annotations on the pull request's lines: `args: --format github`.
+
+Alerts in the repository's code scanning tab (the job still fails on a
+violation; the upload runs anyway):
+
+```yaml
+permissions:
+  contents: read
+  security-events: write   # upload-sarif needs it
+steps:
+  - uses: actions/checkout@v4
+  - run: pip install adr-drift && adr-drift check --format sarif > adr-drift.sarif
+  - if: always()
+    uses: github/codeql-action/upload-sarif@v3
+    with:
+      sarif_file: adr-drift.sarif
+```
+
+[pre-commit](https://pre-commit.com): this repository ships a hook.
+
+```yaml
+repos:
+  - repo: https://github.com/calasdan-sketch/adr-drift
+    rev: main            # better: a release tag
+    hooks:
+      - id: adr-drift
+```
+
 `--fail-on none` reports without failing. With no rules at all, `check`
 exits 2 (nothing is enforced) unless you pass `--allow-empty` (in the action:
 `args: --allow-empty`), which is meant for adopting gradually: right after
@@ -264,6 +375,32 @@ exits 2 (nothing is enforced) unless you pass `--allow-empty` (in the action:
 so give it `fetch-depth: 0` (otherwise `drift` exits 2 and says so). For a
 pull request compare against where the branch left the base:
 `adr-drift drift --since "$(git merge-base origin/main HEAD)"`.
+
+## How it compares
+
+Checked on 2026-11-06 against each project's own pages (linked); the cells
+say only what those pages say - corrections welcome. Where those tools are
+stronger, the table says so.
+
+| | adr-drift | [import-linter](https://import-linter.readthedocs.io/en/stable/contract_types/) | [Tach](https://github.com/tach-org/tach) | [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) | [deptrac](https://deptrac.github.io/deptrac/formatters) |
+|---|---|---|---|---|---|
+| Languages | Python (exact); JS/TS, Go, Rust, Java, Ruby, PHP (heuristic) | Python | Python | JavaScript, TypeScript, CoffeeScript (+ .vue, .svelte) | PHP |
+| Where the rules live | your ADRs and `arch.yaml` | its own config (INI / TOML) | `tach.toml` | its own config file | its own config (unverified) |
+| Code patterns (forbid / require a regex) | yes | not on the linked page | not on the linked page | not on the linked page | not on the linked page |
+| Dependency cycles | between layers | `acyclic_siblings` contract | yes | yes (`--init` adds the rule) | not on the linked page |
+| Other contract types | - | protected, independence, layers | interfaces, deprecated deps, ownership | orphans, missing / dev-only package.json deps | - |
+| Grandfathering / adoption | `baseline` + `drift` | not on the linked page | "incremental adoption" | not described on the README | `--formatter=baseline` |
+| CI output | human, JSON, GitHub annotations, SARIF | not on the linked page | terminal, DOT, JSON | err, dot, html, mermaid, json, csv | table, GitHub Actions, JUnit, Code Climate, JSON, Graphviz, Mermaid |
+| Graph pictures | no | not on the linked page | yes (DOT, web) | yes (dot, mermaid, html) | yes (Graphviz, Mermaid) |
+| Install footprint | Python stdlib only | Python package | Rust-built Python package | Node.js package | PHP package |
+
+What they do better: import-linter has more contract kinds and a real
+import graph; Tach also checks that modules use each other's public
+interface and has a VS Code extension; dependency-cruiser resolves real
+module paths (tsconfig aliases included) and draws the graph; deptrac
+emits more report formats. adr-drift is the one that reads the decision
+records themselves, spans languages in one config, and checks code
+patterns.
 
 ## Limitations
 
@@ -284,6 +421,11 @@ pull request compare against where the branch left the base:
   violation for another in the same file is not seen, and with several
   identical violations in a file `drift` knows how many are new, not always
   which.
+- `forbid-cycles` works on the layers of `arch.yaml` only (not on modules
+  or packages without a layer), reports one loop per group of layers that
+  depend on each other (fix it and the next one may show), and is checked by
+  `check` and `baseline`, not by `drift`: a loop can run through files the
+  range did not touch (`drift` says so on stderr).
 - `drift` compares `HEAD` with the ref itself, not with the merge base, and
   ignores uncommitted edits. It needs a git repository with enough history;
   `check` works anywhere.

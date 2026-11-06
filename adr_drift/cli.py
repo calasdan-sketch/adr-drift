@@ -27,6 +27,7 @@ from . import diag as diag_mod
 from . import engine as engine_mod
 from . import githelp
 from . import langs as langs_mod
+from . import report as report_mod
 from . import rules as rules_mod
 from . import scanner as scanner_mod
 
@@ -91,6 +92,8 @@ ARCH_TEMPLATE = """# ADR Drift architecture config.
 #   forbid-import: <from> -> <to>      layer/module <from> may not import <to>
 #   forbid-pattern: <glob> !~ <regex>  files matching <glob> must not contain <regex>
 #   require-pattern: <glob> =~ <regex> files matching <glob> must contain <regex>
+#   forbid-cycles: <layers>            the layers matching <layers> (e.g. *) must
+#                                      not depend on each other in a loop
 {layers}
 rules:
   # Tighten me: uncomment and adapt.
@@ -119,6 +122,9 @@ are commented out; delete the leading "#" to enforce one:
     # - forbid-import: handlers -> db.drivers
     # - forbid-pattern: src/**.py !~ \\beval\\(
     # - require-pattern: src/handlers/**.py =~ authenticate\\(
+    # - forbid-cycles: *
+
+A Superseded, Deprecated or Rejected ADR's constraints are not enforced.
 
 ## Consequences
 
@@ -239,6 +245,24 @@ def _load_or_report(root: str, adr_dir: str):
     return None
 
 
+def _announce_inactive(loaded) -> None:
+    """Say on stderr which ADRs are retired and how many rules that drops:
+    a rule that stops being enforced must never do so in silence."""
+    for path, status, n in loaded.inactive:
+        if n:
+            print(f"note: {path} is {status!r}: its {n} "
+                  f"rule{'' if n == 1 else 's'} {'is' if n == 1 else 'are'} "
+                  "not enforced", file=sys.stderr)
+
+
+def _empty_report(fmt: str) -> None:
+    """What stdout says for "nothing to report" in a machine format."""
+    if fmt == "json":
+        print("[]")
+    elif fmt == "sarif":
+        print(report_mod.sarif_text([], VERSION, engine_mod.identity))
+
+
 def _no_rules_message() -> str:
     return (f"no rules found {sym('—')} run `adr-drift init` or add a "
             "## Constraints section to an ADR.")
@@ -257,8 +281,8 @@ def _nothing_to_enforce(args) -> int:
               "nothing; add a rule, or pass --allow-empty while you adopt "
               "adr-drift gradually.", file=sys.stderr)
         return 2
-    if getattr(args, "format", "human") == "json":
-        print("[]")
+    if getattr(args, "format", "human") in ("json", "sarif"):
+        _empty_report(args.format)
         print(message, file=sys.stderr)
     else:
         print(message)
@@ -283,9 +307,25 @@ def _adrs_read(n: int) -> str:
     return f"{n} ADR{'' if n == 1 else 's'} read"
 
 
-def _print_violations(violations, fmt: str, adr_count: int) -> None:
+def _print_machine(violations, fmt: str, diag) -> bool:
+    """Print `violations` in a machine format -> False for "human"."""
     if fmt == "json":
         print(json.dumps([v.as_dict() for v in violations], indent=2))
+    elif fmt == "sarif":
+        print(report_mod.sarif_text(violations, VERSION, engine_mod.identity))
+    elif fmt == "github":
+        for line in report_mod.github_annotations(violations,
+                                                  diag.warnings):
+            print(line)
+    else:
+        return False
+    return True
+
+
+def _print_violations(violations, fmt: str, adr_count: int,
+                      diag=None) -> None:
+    diag = diag if diag is not None else diag_mod.Diagnostics(echo=False)
+    if _print_machine(violations, fmt, diag) and fmt != "github":
         return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
@@ -304,6 +344,8 @@ def _print_violations(violations, fmt: str, adr_count: int) -> None:
         for v in by_file[path]:
             where = f":{v.line}" if v.line else ""
             print(f"    {path}{where}: {v.detail}")
+            for step in v.evidence:
+                print(f"      {step}")
             print(f"      rule: {v.rule.describe()} ({v.rule.source})")
 
 
@@ -315,6 +357,7 @@ def cmd_check(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _announce_inactive(loaded)
     if not loaded.rules:
         return _nothing_to_enforce(args)
     entries = None
@@ -327,7 +370,7 @@ def cmd_check(args) -> int:
                                   diag=diag)
     if entries is not None:
         violations = engine_mod.not_baselined(violations, entries)
-    _print_violations(violations, args.format, len(loaded.adrs))
+    _print_violations(violations, args.format, len(loaded.adrs), diag)
     return _verdict(args, violations, diag)
 
 
@@ -362,6 +405,7 @@ def cmd_baseline(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _announce_inactive(loaded)
     if not loaded.rules and not args.allow_empty:
         # An empty baseline grandfathers nothing: a mistake, not a result.
         print(_no_rules_message(), file=sys.stderr)
@@ -410,8 +454,25 @@ def cmd_drift(args) -> int:
     diag = diag_mod.Diagnostics()
     for message in loaded.warnings:
         diag.warn(message)
+    _announce_inactive(loaded)
     if not all_rules:
         return _nothing_to_enforce(args)
+    # A cycle can run through files the range did not touch, and drift only
+    # reads the changed ones: it cannot judge forbid-cycles. Say so, and if
+    # nothing else is left, warn (a green drift would mean nothing).
+    cycles = [r for r in all_rules if r.kind == "forbid-cycles"]
+    all_rules = [r for r in all_rules if r.kind != "forbid-cycles"]
+    if cycles:
+        n = len(cycles)
+        text = (f"{n} forbid-cycles rule{'' if n == 1 else 's'} "
+                f"{'is' if n == 1 else 'are'} checked by `adr-drift check`, "
+                "not by `drift` (a cycle can run through files that did not "
+                "change)")
+        if all_rules:
+            print(f"note: {text}", file=sys.stderr)
+        else:
+            diag.warn(text + "; no other rule is left, so drift checks "
+                      "nothing")
 
     # Compare commits: the base ref against HEAD. Both sides are read out of
     # git, so the working tree (uncommitted edits) never matters, and a
@@ -426,8 +487,12 @@ def cmd_drift(args) -> int:
     except githelp.GitError as e:
         return _git_failed(e)
     if not changed:
-        if args.format == "json":
-            print("[]")
+        if args.format in ("json", "sarif"):
+            _empty_report(args.format)
+        elif args.format == "github":
+            for line in report_mod.github_annotations([], diag.warnings):
+                print(line)
+            print(f"no source files changed since {args.since} -- no drift")
         else:
             print(f"no source files changed since {args.since} "
                   f"{sym('—')} no drift")
@@ -460,10 +525,13 @@ def cmd_drift(args) -> int:
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
 
-    if args.format == "json":
-        # Stable contract: the JSON list is the NEW violations, as before.
-        # Fixed violations are reported in the human output.
-        print(json.dumps([v.as_dict() for v in new_violations], indent=2))
+    if _print_machine(new_violations, args.format, diag):
+        # Stable contract: the JSON list (and the SARIF results, and the
+        # annotations) are the NEW violations, as before. Fixed violations
+        # are reported in the human output.
+        if args.format == "github":
+            print(f"{len(new_violations)} new violation(s) since "
+                  f"{args.since}, {len(fixed_violations)} fixed")
     else:
         if not new_violations:
             print(f"{sym('✓')} no new drift since {args.since} "
@@ -587,6 +655,12 @@ def _adr_dir_arg(value: str) -> str:
     return value
 
 
+FORMATS = ["human", "json", "github", "sarif"]
+FORMAT_HELP = ("human (default), json (a bare array of violations), github "
+               "(GitHub Actions annotations on the offending lines, then the "
+               "human report) or sarif (SARIF 2.1.0 for code scanning).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="adr-drift",
@@ -610,7 +684,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("check", parents=where,
                        help="Verify the repo against all rules.")
-    c.add_argument("--format", choices=["human", "json"], default="human")
+    c.add_argument("--format", choices=FORMATS, default="human",
+                   help=FORMAT_HELP)
     c.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     c.add_argument("--strict-py-only", action="store_true",
@@ -640,7 +715,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="New violations since a git ref.")
     d.add_argument("--since", default="HEAD~5",
                    help="Git ref to compare against (default: HEAD~5).")
-    d.add_argument("--format", choices=["human", "json"], default="human")
+    d.add_argument("--format", choices=FORMATS, default="human",
+                   help=FORMAT_HELP)
     d.add_argument("--fail-on", choices=["violations", "none"],
                    default="violations")
     d.add_argument("--allow-empty", action="store_true",
@@ -725,7 +801,9 @@ class _PipeSafe:
             _discard_output(self._stream)
 
     def write(self, text):
-        self._call("write", text)
+        # Paths, module names and patterns come from the repository being
+        # checked: never let one reach the terminal as a control sequence.
+        self._call("write", report_mod.escape_terminal(text))
         return len(text)
 
     def flush(self):
