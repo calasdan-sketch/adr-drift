@@ -66,3 +66,12 @@ dependency-cruiser when they are installed (`pip install import-linter tach`,
 `npm i dependency-cruiser`; set `DEPCRUISE` to the binary if it is not on
 PATH). Each tool gets the configuration written in the script. Nothing is
 installed for you. See the main README for the numbers.
+
+## Round 4 check (2026-11-07, shared machine)
+
+Detection unchanged: 497 / 497 found, 0 false alarms, for the round-3 commit
+and for round 4. Speed on 20 000 files, best of 3, with a load average of 8
+to 17 on 2 CPUs because other jobs shared the machine: round 3 6.1 s and
+11.2 s, round 4 8.5 s and 7.4 s in two back-to-back pairs. That is noise, not
+a difference; the scan code did not change in round 4 (only error handling
+and the Windows job limit). The 1.9 s above is from a quiet machine.

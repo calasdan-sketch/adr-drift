@@ -8,6 +8,39 @@ monorepo engineer, a CI lead, a governance lead and a skeptical tech lead)
 found missing. Benchmark on a generated seven-language corpus
 (`benchmarks/`): recall 63.2% -> 100%, precision 85.8% -> 100%.
 
+### Expert round 4 (still 0.3.0, unreleased): the first hour after `pip install`
+
+Panel (independent reviewers could not be spawned; one author played each
+role and ran each command, see `docs/ROUND4.md`): a first-time user following
+only the README, a packaging engineer, a supply-chain reviewer, a
+hostile-input fuzzer, a Windows reader, a CI integrator. Registry check:
+PyPI has 0.1.0 only, so the next release is 0.3.0 (0.2.0 was never
+published); under 0.x it is a minor bump that changes behaviour, see the
+notes under 0.2.0 and 0.3.0 *Changed*.
+
+Fixed
+- A full disk, a read-only directory or any other file error ended in a
+  Python traceback with exit 1, which reads as "violations found". It is now
+  `error: ...` and exit 2; so is an internal error (with a plain message;
+  `ADR_DRIFT_DEBUG=1` restores the traceback), and Ctrl-C is 130. A report
+  that could not be written (`> /dev/full`) is exit 2, not the command's
+  own 0 or 1.
+- `arch.yaml`, the baseline, ADRs and the index are written as UTF-8 with LF
+  on every platform (Windows wrote CRLF) and replaced whole through a
+  temporary file, so an interrupted run cannot leave half a file.
+- `new` no longer overwrites an ADR another `new` created at the same moment,
+  and a title with no letters (`???`) or 400 characters gives a sane file name.
+- The package page on PyPI was empty of metadata: license (MIT), author,
+  project URLs, keywords, classifiers. The version is written once
+  (`adr_drift/__init__.py`), pyproject reads it.
+
+Added
+- `init --suggest` writes the rules that already hold in the code (the ones
+  `suggest` prints) into the new arch.yaml, so the first `check` passes and
+  enforces them.
+- `tests/test_round4.py`: stdlib-only imports, version and metadata
+  consistency, failed-run exit codes, atomic LF writes, `new` races.
+
 ### Expert round 3 (still 0.3.0, unreleased)
 
 Panel: an attacker (a pull request that carries hostile rules and files), a

@@ -59,8 +59,10 @@ class TestExitCodeSurvivesAClosedPipe(unittest.TestCase):
             self.assertEqual(self._run(True, code), code)
 
     def test_einval_is_still_an_error_off_windows(self):
-        with self.assertRaises(OSError):
-            self._run(False, 0)
+        # a failed flush that is not a closed pipe means the report did not
+        # arrive: exit 2, never the command's own 0 or 1, never a traceback
+        for code in (0, 1):
+            self.assertEqual(self._run(False, code), 2)
 
 
 class TestRealClosedPipe(unittest.TestCase):

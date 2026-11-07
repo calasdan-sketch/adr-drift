@@ -53,24 +53,28 @@ PHP-only. ADR Drift is language-agnostic, repo-local, and CI-friendly.
 ## Install
 
 ```bash
-pip install adr-drift                                          # the released version
-pip install git+https://github.com/calasdan-sketch/adr-drift   # the latest code
+pip install git+https://github.com/calasdan-sketch/adr-drift   # 0.3.0, this README
+pip install adr-drift                                          # PyPI
 ```
 
-Either provides `adr-drift`; Python 3.10+ and nothing else. Or run without
-installing: `python3 -m adr_drift` from the repo root. This README describes
-0.3.0, which is not on PyPI yet (see [CHANGELOG.md](CHANGELOG.md)): until it
-is, everything below that is newer than the released version (cycles,
-`--format github|sarif|markdown`, retired ADRs, the layer rules, waivers,
-`coverage`, alias resolution) needs the second line.
+Either provides `adr-drift`; Python 3.10+ and nothing else (no
+dependencies). Or run without installing: `python3 -m adr_drift` from the
+repo root.
+
+PyPI had only **0.1.0** when this was written (2026-11-07, `pip index
+versions adr-drift`). This README describes 0.3.0 (see
+[CHANGELOG.md](CHANGELOG.md)): until 0.3.0 is on PyPI, everything newer than
+0.1.0 - cycles, `--format github|sarif|markdown`, retired ADRs, the layer
+rules, waivers, `coverage`, alias resolution, `suggest` - needs the first
+line. `adr-drift --version` tells you which one you have.
 
 ## Quick start
 
 ```bash
 cd your-repo
-python3 -m adr_drift init      # scaffold arch.yaml + sample ADR from folder layout
-python3 -m adr_drift suggest   # rules that already hold in your code, to paste in
-# enable a rule in arch.yaml and/or add ## Constraints to your ADRs
+python3 -m adr_drift init --suggest   # arch.yaml + sample ADR from the folder layout,
+                                      # with the rules your code already follows
+# add your own rule in arch.yaml and/or a ## Constraints section in an ADR
 python3 -m adr_drift check     # verify; exit 1 on violations (CI-ready)
 # repo already has legacy violations? grandfather them, then enforce:
 python3 -m adr_drift baseline                    # record current violations
@@ -81,7 +85,7 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 
 | Command | What it does |
 |---|---|
-| `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index (a `README.md` of yours is kept) |
+| `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index (a `README.md` of yours is kept); `--suggest` also writes the rules that already hold in the code (what `suggest` prints), so the first `check` passes and enforces them |
 | `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules; `--ratchet` also fails when a baselined violation was fixed; `--jobs N` reads files in N processes) |
 | `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` (violations covered by a live waiver are left out) |
 | `coverage` | Which ADRs in force enforce a rule, which name paths that no longer exist, and the waivers (`--fail-under PERCENT`; exit 1 on an expired waiver) |
@@ -426,7 +430,8 @@ imports enforces nothing. `--strict` makes that an error.
 |---|---|
 | 0 | no violations (and, with `--strict`, no warnings) |
 | 1 | violations found (`--fail-on none` makes every run report-only: exit 0) |
-| 2 | the configuration or the invocation is wrong: unparsable rule, no rules, bad baseline, `--strict` with warnings |
+| 2 | the run did not finish or its output cannot be trusted: unparsable rule, no rules, bad baseline, `--strict` with warnings, a file that cannot be read or written (full disk, read-only directory), a report that could not be written, an internal error (a bug: the message says so; `ADR_DRIFT_DEBUG=1` shows the traceback) |
+| 130 | interrupted (Ctrl-C) |
 
 stdout carries only the report. With `--format json` it is always a bare
 array of violations (`[]` when clean) - or empty when the exit code is 2 -
@@ -669,9 +674,12 @@ and keeps waivers and the baseline honest.
 - Go: the nearest `go.mod` is read, `go.work` is not. Config files are read
   from the working tree, also by `drift` (a tsconfig changed in the range is
   not compared).
-- Windows: files are always read and written as UTF-8, and on a console that
-  can't show the check marks (cp1252 pipes) the report falls back to
-  `[ok]`/`[x]`.
+- Windows: files are always read and written as UTF-8 with LF line ends, and
+  on a console that can't show the check marks (cp1252 pipes) the report
+  falls back to `[ok]`/`[x]`. The test suite runs on Windows in CI
+  (`.github/workflows/ci.yml`), but the author has **never run it on
+  Windows**: round 4 reviewed the code for it by reading only (paths, line
+  ends, `os.replace`, console encoding, signals) and fixed what that found.
 - `suggest` only sees imports between the layers of `arch.yaml`; its
   `layer-order` fixes an order for layers that never import each other
   (alphabetical, and it says so), and its output describes the code today,

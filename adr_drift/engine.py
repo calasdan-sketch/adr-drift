@@ -398,15 +398,25 @@ def _scan_all(paths: list, root: str, strict_py_only: bool, go_module: str,
               need_content: bool, jobs: int) -> list:
     """The _scan_file() result of every path, in path order."""
     args = (root, strict_py_only, go_module, need_content)
+    if os.name == "nt":
+        jobs = min(jobs, 61)  # ProcessPoolExecutor's limit on Windows
     if jobs > 1 and len(paths) >= PARALLEL_MIN_FILES:
         try:
             import concurrent.futures as futures
+            import concurrent.futures.process as _process  # noqa: F401
+        except ImportError:
+            futures = None
+        try:
+            if futures is None:
+                raise ImportError("no multiprocessing here")
             with futures.ProcessPoolExecutor(
                     max_workers=jobs, initializer=_init_worker,
                     initargs=args) as pool:
                 chunk = max(16, len(paths) // (jobs * 8))
                 return list(pool.map(_scan_file, paths, chunksize=chunk))
-        except (OSError, ImportError, futures.process.BrokenProcessPool):
+        except (OSError, ImportError, ValueError,
+                getattr(getattr(futures, "process", None),
+                        "BrokenProcessPool", OSError)):
             pass                      # no pool here: do it in this process
     _init_worker(*args)
     return [_scan_file(p) for p in paths]

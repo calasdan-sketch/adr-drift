@@ -407,17 +407,18 @@ class TestOptionsBeforeAndAfterTheSubcommand(unittest.TestCase):
 
 
 class TestVersion(unittest.TestCase):
-    """The version lives in three places; they must not drift apart."""
+    """The version is written once (adr_drift/__init__.py); the CLI reports it."""
 
     def test_pyproject_package_and_cli_agree(self):
         import re
         import adr_drift
         with open(os.path.join(REPO_ROOT, "pyproject.toml"),
                   encoding="utf-8") as f:
-            m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', f.read())
-        self.assertIsNotNone(m, "pyproject.toml has no version")
-        self.assertEqual(adr_drift.__version__, m.group(1))
-        self.assertEqual(cli_mod.VERSION, m.group(1))
+            text = f.read()
+        # one source of truth: pyproject reads adr_drift.__version__
+        self.assertIsNone(re.search(r'(?m)^version\s*=\s*"', text))
+        self.assertIn('version = { attr = "adr_drift.__version__" }', text)
+        self.assertEqual(cli_mod.VERSION, adr_drift.__version__)
 
     def test_version_flag_prints_it(self):
         out = io.StringIO()

@@ -21,6 +21,7 @@ import os
 import posixpath
 import re
 import sys
+import tempfile
 
 from . import __version__
 from . import config as config_mod
@@ -58,6 +59,43 @@ def sym(s: str) -> str:
         return _ASCII_SYMBOLS.get(
             s, s.encode("ascii", "replace").decode("ascii"))
     return s
+
+
+def _write_text(path: str, text: str, exclusive: bool = False) -> None:
+    """Write `text` as UTF-8 with LF line ends on every platform.
+
+    A file that already exists is replaced whole (a temporary file in the
+    same directory, then os.replace), so a full disk or a Ctrl-C never
+    leaves a half-written arch.yaml or baseline. With `exclusive` the file
+    must be new (FileExistsError otherwise), so two `new` commands racing
+    for the next number cannot overwrite each other.
+    """
+    if exclusive:
+        with open(path, "x", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if os.path.islink(path):
+        path = os.path.realpath(path)  # keep a symlinked arch.yaml a link
+    fd, tmp = tempfile.mkstemp(prefix=".adr-drift-", suffix=".tmp",
+                               dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _harden_streams() -> None:
@@ -205,9 +243,8 @@ def _sample_adr(root: str, adr_rel: str) -> "tuple[str, bool]":
     n = config_mod.next_adr_number(root, adr_rel)
     path = os.path.join(root, adr_rel,
                         f"{n:04d}-record-architecture-decisions.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(ADR_TEMPLATE.format(num=n,
-                                    title="Record architecture decisions"))
+    _write_text(path, ADR_TEMPLATE.format(
+        num=n, title="Record architecture decisions"), exclusive=True)
     return path, True
 
 
@@ -221,10 +258,10 @@ def cmd_init(args) -> int:
     layer_yaml = "".join(
         f"  - name: {l['name']}\n    paths: {[p for p in l['paths']]}".replace(
             "'", '"') + "\n" for l in layers)
-    with open(arch_path, "w", encoding="utf-8") as f:
-        f.write(ARCH_TEMPLATE.format(
-            layers=("layers:\n" + layer_yaml.rstrip("\n")) if layer_yaml
-            else "layers: []"))
+    _write_text(arch_path, ARCH_TEMPLATE.format(
+        layers=("layers:\n" + layer_yaml.rstrip("\n")) if layer_yaml
+        else "layers: []"))
+    proven = _init_suggested(args, arch_path) if args.suggest else []
     adr_rel = config_mod.primary_adr_dir(root, args.adr_dir)
     os.makedirs(os.path.join(root, adr_rel), exist_ok=True)
     sample, created = _sample_adr(root, adr_rel)
@@ -239,11 +276,45 @@ def cmd_init(args) -> int:
     if not ours:
         print(f"kept {readme}: adr-drift did not write it (`adr-drift index "
               "--force` replaces it with a generated index)")
+    if proven:
+        for r in proven:
+            print(f"rule written (it holds in the code today): {r}")
+        print("Next: run `adr-drift check`; it should pass, and from now on "
+              "it keeps these rules true.")
+        return 0
     print("Next: enable at least one rule in arch.yaml, then run "
           "`adr-drift check`.")
     print("(With no rules `check` exits 2, because nothing is enforced; "
           "pass --allow-empty to accept that while you adopt gradually.)")
+    if args.suggest:
+        print("--suggest found no rule that already holds; `adr-drift "
+              "suggest` says why.")
     return 0
+
+
+def _init_suggested(args, arch_path: str) -> list:
+    """Put the rules `suggest` can back into the arch.yaml just written ->
+    the rules written (none: the file is left as it is)."""
+    ns = argparse.Namespace(root=args.root, adr_dir=args.adr_dir, jobs=0)
+    got = _layers_or_report(ns)
+    if got is None:
+        return []
+    loaded, _entries, graph = got
+    rules = graphs_mod.suggest(graph, {r.kind for r in loaded.rules})["rules"]
+    for n in graphs_mod.suggest(graph, set())["notes"]:
+        print(f"note: {report_mod.escape_terminal(n)}", file=sys.stderr)
+    if not rules:
+        return []
+    with open(arch_path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    marker = ('  # Tighten me: uncomment and adapt.\n'
+              '  # - "forbid-import: handlers -> db.drivers"\n')
+    if marker not in text:
+        return []
+    block = "  # Written by `init --suggest`: these hold in the code today.\n"
+    block += "".join(f'  - "{r}"\n' for r in rules)
+    _write_text(arch_path, text.replace(marker, block + marker, 1))
+    return rules
 
 
 def _load_or_report(root: str, adr_dir: str):
@@ -525,9 +596,8 @@ def cmd_baseline(args) -> int:
         return 2
     out = (args.output if os.path.isabs(args.output)
            else os.path.join(root, args.output))
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump([v.as_dict() for v in violations], f, indent=2)
-        f.write("\n")
+    _write_text(out, json.dumps([v.as_dict() for v in violations],
+                                indent=2) + "\n")
     rel = os.path.relpath(out, root)
     print(f"wrote {len(violations)} baselined violation(s) -> {rel}")
     print(f"run `adr-drift check --baseline {rel}` to grandfather them.")
@@ -821,10 +891,19 @@ def cmd_new(args) -> int:
     adr_dir = os.path.join(args.root, adr_rel)
     os.makedirs(adr_dir, exist_ok=True)
     n = config_mod.next_adr_number(args.root, adr_rel)
-    slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")
-    path = os.path.join(adr_dir, f"{n:04d}-{slug}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(ADR_TEMPLATE.format(num=n, title=args.title))
+    slug = re.sub(r"[^a-z0-9]+", "-", args.title.lower()).strip("-")[:60]
+    slug = slug.strip("-") or "untitled"
+    for _ in range(50):  # another `new` may have taken the number meanwhile
+        path = os.path.join(adr_dir, f"{n:04d}-{slug}.md")
+        try:
+            _write_text(path, ADR_TEMPLATE.format(num=n, title=args.title),
+                        exclusive=True)
+            break
+        except FileExistsError:
+            n += 1
+    else:
+        print("error: could not find a free ADR number", file=sys.stderr)
+        return 2
     print(f"created {os.path.relpath(path, args.root)}")
     return 0
 
@@ -851,8 +930,7 @@ def _write_index(root: str, adr_rel: str) -> int:
         lines.append(f"| {a['number']} | [{_cell(a['title'])}]({rel}) "
                      f"| {status} |")
     lines.append("")
-    with open(os.path.join(adr_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    _write_text(os.path.join(adr_dir, "README.md"), "\n".join(lines))
     return len(adrs)
 
 
@@ -951,6 +1029,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     i = sub.add_parser("init", parents=where,
                        help="Scaffold arch.yaml + sample ADR.")
+    i.add_argument("--suggest", action="store_true",
+                   help="Also write the rules that already hold in the code "
+                        "(what `suggest` prints), so the first `check` "
+                        "passes and enforces them.")
     i.add_argument("--force", action="store_true",
                    help="Overwrite an existing arch.yaml. A README.md that "
                         "adr-drift did not write is kept (see index "
@@ -1126,6 +1208,10 @@ class _PipeSafe:
         return getattr(self._stream, name)
 
 
+#: Set when the last flush of the report failed (not a closed pipe).
+_OUTPUT_FAILED: list = []
+
+
 @contextlib.contextmanager
 def _closed_pipe_tolerant():
     """Run the body with stdout and stderr wrapped in _PipeSafe."""
@@ -1144,6 +1230,8 @@ def _closed_pipe_tolerant():
             for s in safe:
                 if s is not None:
                     s.flush()
+        except OSError as e:  # a full disk under `> report.txt`
+            _OUTPUT_FAILED.append(str(e))
         finally:
             sys.stdout, sys.stderr = real
 
@@ -1152,8 +1240,21 @@ def main(argv=None) -> int:
     _harden_streams()
     # `adr-drift check | head -1` must neither traceback nor change the exit
     # code (check's exit code is the verdict).
+    del _OUTPUT_FAILED[:]
     with _closed_pipe_tolerant():
-        return _main(argv)
+        rc = _main(argv)
+    if _OUTPUT_FAILED:
+        # The report did not reach its destination: not a pass, and not
+        # "violations found" either.
+        try:
+            sys.stderr.write("error: could not write the report: "
+                             + report_mod.escape_terminal(_OUTPUT_FAILED[0])
+                             + "\n")
+            sys.stderr.flush()
+        except OSError:
+            pass
+        return 2
+    return rc
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1172,6 +1273,25 @@ def _main(argv) -> int:
         return _dispatch(args)
     except engine_mod.RuleTooSlow as e:
         print(f"error: {report_mod.escape_terminal(str(e))}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except OSError as e:
+        # A full disk, a read-only directory, a file that vanished: exit 2
+        # (a problem with the run), never a traceback and never exit 1,
+        # which means "violations found".
+        print("error: cannot read or write a file: "
+              + report_mod.escape_terminal(str(e)), file=sys.stderr)
+        return 2
+    except Exception as e:  # a bug in adr-drift: say so, keep the verdict honest
+        if os.environ.get("ADR_DRIFT_DEBUG"):
+            raise
+        print("error: adr-drift hit an internal error and stopped "
+              f"({type(e).__name__}: {report_mod.escape_terminal(str(e))}); "
+              "the check did not finish. Please report it with the command "
+              "you ran; ADR_DRIFT_DEBUG=1 shows the traceback.",
+              file=sys.stderr)
         return 2
 
 
