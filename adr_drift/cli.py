@@ -5,6 +5,7 @@ Commands:
   check     verify the repo against arch.yaml + ADR Constraints (CI-friendly)
   baseline  record current violations so check --baseline can grandfather them
   drift     report NEW violations introduced since a git ref
+  coverage  which ADRs enforce a rule; the waivers in force
   new       create the next-numbered ADR from a template
   index     regenerate the one-sentence-per-ADR index (docs/adr/README.md)
 """
@@ -25,10 +26,12 @@ from . import __version__
 from . import config as config_mod
 from . import diag as diag_mod
 from . import engine as engine_mod
+from . import codeowners as codeowners_mod
 from . import githelp
+from . import governance as governance_mod
 from . import langs as langs_mod
 from . import report as report_mod
-from . import rules as rules_mod
+from . import resolve as resolve_mod
 from . import scanner as scanner_mod
 
 VERSION = __version__
@@ -94,6 +97,16 @@ ARCH_TEMPLATE = """# ADR Drift architecture config.
 #   require-pattern: <glob> =~ <regex> files matching <glob> must contain <regex>
 #   forbid-cycles: <layers>            the layers matching <layers> (e.g. *) must
 #                                      not depend on each other in a loop
+#   layer-order: a > b > c             a layer imports only layers to its right
+#   only-import: <layer> -> x, y       <layer> may import only layers x and y
+#   public-api: <layer> -> <module>    outside <layer>, only <module> is imported
+# Waivers (a time-boxed exception, with an owner) go in a `waivers:` list:
+#   waivers:
+#     - rule: "handlers must not import db"   # as `check` prints it
+#       paths: ["src/handlers/legacy/**"]     # optional
+#       owner: alice
+#       expires: 2027-03-31
+#       reason: "migration ticket 123"
 {layers}
 rules:
   # Tighten me: uncomment and adapt.
@@ -123,6 +136,8 @@ are commented out; delete the leading "#" to enforce one:
     # - forbid-pattern: src/**.py !~ \\beval\\(
     # - require-pattern: src/handlers/**.py =~ authenticate\\(
     # - forbid-cycles: *
+    # - layer-order: handlers > services > db
+    # - public-api: db -> db.api
 
 A Superseded, Deprecated or Rejected ADR's constraints are not enforced.
 
@@ -258,6 +273,8 @@ def _empty_report(fmt: str, root: str = "", retired=()) -> None:
     """What stdout says for "nothing to report" in a machine format."""
     if fmt == "json":
         print("[]")
+    elif fmt == "markdown":
+        print(report_mod.markdown_report([], {}, lambda p: []).rstrip("\n"))
     elif fmt == "sarif":
         print(report_mod.sarif_text(
             [], VERSION, engine_mod.identity,
@@ -282,7 +299,7 @@ def _nothing_to_enforce(args) -> int:
               "nothing; add a rule, or pass --allow-empty while you adopt "
               "adr-drift gradually.", file=sys.stderr)
         return 2
-    if getattr(args, "format", "human") in ("json", "sarif"):
+    if getattr(args, "format", "human") in ("json", "sarif", "markdown"):
         _empty_report(args.format, getattr(args, "root", ""))
         print(message, file=sys.stderr)
     else:
@@ -312,15 +329,39 @@ class ReportError(Exception):
     """The report could not be written (exit 2, never a traceback)."""
 
 
+def _repo_top(root: str, prefix: str) -> str:
+    """The top of the git repository, given --root and its prefix in it."""
+    top = os.path.abspath(root)
+    for part in [p for p in prefix.split("/") if p]:
+        top = os.path.dirname(top)
+    return top
+
+
+def _markdown(violations, loaded, root: str, prefix: str, diag,
+              retired) -> str:
+    adrs = {}
+    for a in (loaded.adrs if loaded is not None else []):
+        shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+        adrs[shown] = a
+    owners = codeowners_mod.load(_repo_top(root, prefix))
+    note = (f"{len(diag.warnings)} warning"
+            f"{'' if len(diag.warnings) == 1 else 's'} - see the job log"
+            if diag.warnings else "")
+    join = (lambda p: (prefix.rstrip("/") + "/" + p) if prefix else p)
+    return report_mod.markdown_report(
+        violations, adrs, lambda p: owners.owners(join(p)), prefix,
+        note=note, retired=retired)
+
+
 def _print_machine(violations, fmt: str, diag, root: str = "",
-                   retired=()) -> bool:
+                   retired=(), loaded=None) -> bool:
     """Print `violations` in a machine format -> False for "human".
 
     GitHub annotations and SARIF name files from the top of the git
     repository, so --root DIR inside it is put in front of every path.
     Everything is built before anything is printed: a report that cannot be
     built raises ReportError and stdout stays empty."""
-    if fmt not in ("json", "sarif", "github"):
+    if fmt not in ("json", "sarif", "github", "markdown"):
         return False
     prefix = githelp.repo_prefix(root) if root and fmt != "json" else ""
     try:
@@ -330,6 +371,9 @@ def _print_machine(violations, fmt: str, diag, root: str = "",
             text = report_mod.sarif_text(violations, VERSION,
                                          engine_mod.identity, prefix,
                                          retired)
+        elif fmt == "markdown":
+            text = _markdown(violations, loaded, root, prefix, diag,
+                             retired).rstrip("\n")
         else:
             text = "\n".join(report_mod.github_annotations(
                 violations, diag.warnings, prefix, retired))
@@ -341,9 +385,11 @@ def _print_machine(violations, fmt: str, diag, root: str = "",
 
 
 def _print_violations(violations, fmt: str, adr_count: int,
-                      diag=None, root: str = "", retired=()) -> None:
+                      diag=None, root: str = "", retired=(),
+                      loaded=None) -> None:
     diag = diag if diag is not None else diag_mod.Diagnostics(echo=False)
-    if _print_machine(violations, fmt, diag, root, retired) and fmt != "github":
+    if _print_machine(violations, fmt, diag, root, retired,
+                      loaded) and fmt != "github":
         return
     if not violations:
         # "all ADRs hold" over zero ADRs would be a lie: say how many were read
@@ -367,6 +413,24 @@ def _print_violations(violations, fmt: str, adr_count: int,
             print(f"      rule: {v.rule.describe()} ({v.rule.source})")
 
 
+def _waive(violations, loaded, diag, stale: bool = True):
+    """Drop the violations arch.yaml waivers cover (until they expire), say
+    so on stderr, and warn about waivers that expired, end soon or match
+    nothing."""
+    if not loaded.waivers:
+        return violations
+    try:
+        day = governance_mod.today()
+    except ValueError as e:
+        raise ReportError(str(e)) from None
+    kept, waived = governance_mod.apply_waivers(
+        violations, loaded.waivers, day, diag.warn, stale)
+    note = governance_mod.waiver_note(waived)
+    if note:
+        print(note, file=sys.stderr)
+    return kept
+
+
 def cmd_check(args) -> int:
     root = args.root
     loaded = _load_or_report(root, args.adr_dir)
@@ -379,21 +443,34 @@ def cmd_check(args) -> int:
     if not loaded.rules:
         return _nothing_to_enforce(args)
     entries = None
+    if args.ratchet and not args.baseline:
+        print("error: --ratchet needs --baseline FILE", file=sys.stderr)
+        return 2
     if args.baseline:
         entries = _load_baseline(args.baseline, root)
         if entries is None:
             return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
-    if entries is not None:
-        violations = engine_mod.not_baselined(violations, entries)
+                                  diag=diag, jobs=args.jobs)
+    gone: list = []
     try:
+        violations = _waive(violations, loaded, diag)
+        if entries is not None:
+            violations, gone = engine_mod.split_baseline(violations, entries)
         _print_violations(violations, args.format, len(loaded.adrs), diag,
-                          root, loaded.inactive)
+                          root, loaded.inactive, loaded)
     except ReportError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    if args.ratchet and gone and args.fail_on != "none":
+        n = len(gone)
+        print(f"error: --ratchet: {n} grandfathered violation"
+              f"{'' if n == 1 else 's'} in {args.baseline} "
+              f"{'is' if n == 1 else 'are'} fixed. Run `adr-drift baseline` "
+              "and commit it, so they cannot come back unnoticed.",
+              file=sys.stderr)
+        return 1
     return _verdict(args, violations, diag)
 
 
@@ -438,7 +515,12 @@ def cmd_baseline(args) -> int:
         return 2
     violations = engine_mod.check(root, loaded.layers, loaded.rules,
                                   strict_py_only=args.strict_py_only,
-                                  diag=diag)
+                                  diag=diag, jobs=args.jobs)
+    try:
+        violations = _waive(violations, loaded, diag)
+    except ReportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     out = (args.output if os.path.isabs(args.output)
            else os.path.join(root, args.output))
     with open(out, "w", encoding="utf-8") as f:
@@ -510,7 +592,7 @@ def cmd_drift(args) -> int:
     except githelp.GitError as e:
         return _git_failed(e)
     if not changed:
-        if args.format in ("json", "sarif"):
+        if args.format in ("json", "sarif", "markdown"):
             _empty_report(args.format, root, loaded.inactive)
         elif args.format == "github":
             for line in report_mod.github_annotations(
@@ -525,10 +607,11 @@ def cmd_drift(args) -> int:
 
     quiet = diag_mod.Diagnostics(echo=False)  # the base side: warn once
     go_module = langs_mod.go_module_path(root)
+    resolver = resolve_mod.Resolver(root)
 
     def entry(path, data, sink):
         imports, _eng = scanner_mod.extract_imports(
-            path, data, diag=sink, go_module=go_module)
+            path, data, diag=sink, go_module=go_module, resolver=resolver)
         return (path, engine_mod._file_layer(layers, path), imports,
                 scanner_mod.decode_source(path, data))
 
@@ -544,15 +627,23 @@ def cmd_drift(args) -> int:
         if old is not None:
             base_entries.append(entry(c.old_path, old, quiet))
 
+    repo_paths = None
+    if any(engine_mod._complex_globs(l) for l in layers):
+        try:
+            repo_paths = githelp.tree_paths(root)
+        except githelp.GitError as e:
+            return _git_failed(e)
     new_violations, fixed_violations = engine_mod.new_and_fixed(
-        engine_mod.evaluate(base_entries, layers, all_rules),
-        engine_mod.evaluate(now_entries, layers, all_rules), renames)
+        engine_mod.evaluate(base_entries, layers, all_rules, repo_paths),
+        engine_mod.evaluate(now_entries, layers, all_rules, repo_paths),
+        renames)
     fixed_violations = [dataclasses.replace(v, file=renames.get(v.file, v.file))
                         for v in fixed_violations]
 
     try:
+        new_violations = _waive(new_violations, loaded, diag, stale=False)
         machine = _print_machine(new_violations, args.format, diag, root,
-                                 loaded.inactive)
+                                 loaded.inactive, loaded)
     except ReportError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -584,6 +675,56 @@ def cmd_drift(args) -> int:
                 print(f"  {v.file}:{v.line or sym('—')}: {v.detail} (fixed)")
                 print(f"      rule: {v.rule.describe()} ({v.rule.source})")
     return _verdict(args, new_violations, diag)
+
+
+def cmd_coverage(args) -> int:
+    """Which ADRs enforce anything, and the waivers in force."""
+    loaded = _load_or_report(args.root, args.adr_dir)
+    if loaded is None:
+        return 2
+    try:
+        day = governance_mod.today()
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    for message in loaded.warnings:
+        print(f"warning: {message}", file=sys.stderr)
+    cov = governance_mod.coverage(args.root, loaded, day)
+    expired = [w for w in cov["waivers"] if w["state"] == "expired"]
+    failed = (args.fail_under is not None and cov["percent"] < args.fail_under)
+    if args.format == "json":
+        print(json.dumps(cov, indent=2))
+    else:
+        print(f"{cov['enforced']} of {cov['in_force']} ADRs in force "
+              f"enforce at least one rule ({cov['percent']}%)")
+        for row in cov["adrs"]:
+            mark = {"enforced": sym("✓"), "no-rule": sym("✗"),
+                    "retired": "-"}[row["state"]]
+            owners = f"  [{', '.join(row['owners'])}]" if row["owners"] else ""
+            print(f"  {mark} {row['path']}  {row['status'] or sym('—')}  "
+                  f"{row['rules']} rule{'' if row['rules'] == 1 else 's'}"
+                  f"{owners}")
+            if row["state"] == "no-rule":
+                print("      nothing checks this decision: add a "
+                      "## Constraints section")
+            if row.get("hint"):
+                print(f"      hint: {row['hint']}")
+            for ref in row["missing_paths"]:
+                print(f"      mentions {ref}, which does not exist")
+        if cov["waivers"]:
+            print(f"\nwaivers ({len(cov['waivers'])}):")
+            for w in cov["waivers"]:
+                left = (f"expired {-w['days_left']} day(s) ago"
+                        if w["days_left"] < 0 else f"{w['days_left']} day(s) left")
+                print(f"  {w['state']:8s} {w['expires']} ({left})  "
+                      f"{w['owner']}: {w['rule']} - {w['reason']}")
+    if failed:
+        print(f"error: {cov['percent']}% is under --fail-under "
+              f"{args.fail_under}", file=sys.stderr)
+    if expired:
+        print(f"error: {len(expired)} waiver"
+              f"{'' if len(expired) == 1 else 's'} expired", file=sys.stderr)
+    return 1 if (failed or expired) else 0
 
 
 def cmd_new(args) -> int:
@@ -680,16 +821,29 @@ def _location_options(after_subcommand: bool) -> argparse.ArgumentParser:
     return p
 
 
+def _jobs_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if n < 0 or n > 256:
+        raise argparse.ArgumentTypeError("needs a number from 0 to 256 "
+                                         "(0: one per CPU)")
+    return n
+
+
 def _adr_dir_arg(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("needs a directory name")
     return value
 
 
-FORMATS = ["human", "json", "github", "sarif"]
+FORMATS = ["human", "json", "github", "sarif", "markdown"]
 FORMAT_HELP = ("human (default), json (a bare array of violations), github "
                "(GitHub Actions annotations on the offending lines, then the "
-               "human report) or sarif (SARIF 2.1.0 for code scanning).")
+               "human report), sarif (SARIF 2.1.0 for code scanning) or "
+               "markdown (a pull-request comment: the ADR behind each broken "
+               "rule, who decided it, who owns the files).")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -721,9 +875,17 @@ def build_parser() -> argparse.ArgumentParser:
                    default="violations")
     c.add_argument("--strict-py-only", action="store_true",
                    help="Skip the regex fallback for non-Python files.")
+    c.add_argument("--jobs", type=_jobs_arg, default=0, metavar="N",
+                   help="Worker processes for reading files (default: one "
+                        "per CPU, up to 8; small repositories use one). "
+                        "The result is the same for any N.")
     c.add_argument("--baseline", default=None, metavar="FILE",
                    help="Grandfather violations listed in FILE "
                         "(written by `adr-drift baseline`).")
+    c.add_argument("--ratchet", action="store_true",
+                   help="With --baseline: also fail (exit 1) when a "
+                        "grandfathered violation has been fixed and is "
+                        "still listed, so the baseline only ever shrinks.")
     c.add_argument("--allow-empty", action="store_true",
                    help="Exit 0 when there are no rules at all (default: "
                         "exit 2, because nothing would be enforced).")
@@ -738,6 +900,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: .adr-baseline.json under --root).")
     b.add_argument("--strict-py-only", action="store_true",
                    help="Skip the regex fallback for non-Python files.")
+    b.add_argument("--jobs", type=_jobs_arg, default=0, metavar="N",
+                   help="Worker processes (see check --jobs).")
     b.add_argument("--allow-empty", action="store_true",
                    help="Write an empty baseline when there are no rules "
                         "(default: exit 2).")
@@ -755,6 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "exit 2, because nothing would be enforced).")
     d.add_argument("--strict", action="store_true",
                    help="Treat warnings as errors: exit 2.")
+
+    v = sub.add_parser("coverage", parents=where,
+                       help="Which ADRs enforce a rule; the waivers.")
+    v.add_argument("--format", choices=["human", "json"], default="human")
+    v.add_argument("--fail-under", type=int, metavar="PERCENT", default=None,
+                   help="Exit 1 when fewer than PERCENT of the ADRs in force "
+                        "enforce at least one rule.")
 
     n = sub.add_parser("new", parents=where,
                        help="Create the next-numbered ADR.")
@@ -887,7 +1058,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 def _main(argv) -> int:
     args = parse_args(argv)
     return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
-            "drift": cmd_drift, "new": cmd_new,
+            "drift": cmd_drift, "coverage": cmd_coverage, "new": cmd_new,
             "index": cmd_index}[args.cmd](args)
 
 

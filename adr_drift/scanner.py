@@ -82,6 +82,27 @@ def _module_of(path: str) -> tuple[list[str], bool]:
     return parts, False
 
 
+def _dynamic_import_name(call: "ast.Call") -> str:
+    """The module named by `importlib.import_module("m")`, `import_module("m")`
+    or `__import__("m")` when it is a string literal and absolute; else "".
+    A call on some other object (`registry.import_module("m")`) is not an
+    import, and a computed name cannot be known."""
+    fn = call.func
+    if isinstance(fn, ast.Attribute):
+        ok = (fn.attr == "import_module" and isinstance(fn.value, ast.Name)
+              and fn.value.id == "importlib")
+    else:
+        ok = isinstance(fn, ast.Name) and fn.id in ("import_module",
+                                                    "__import__")
+    if not ok or not call.args:
+        return ""
+    first = call.args[0]
+    if (isinstance(first, ast.Constant) and isinstance(first.value, str)
+            and first.value and not first.value.startswith(".")):
+        return first.value
+    return ""
+
+
 def python_imports(source, path: str = "") -> list[tuple[str, int]]:
     """(module, line_no) via AST. `source` is bytes (BOM and coding cookie
     honoured, as Python itself does) or str.
@@ -100,7 +121,11 @@ def python_imports(source, path: str = "") -> list[tuple[str, int]]:
         source = source[1:]
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Call):
+            name = _dynamic_import_name(node)
+            if name:
+                found.append((name, node.lineno))
+        elif isinstance(node, ast.Import):
             for a in node.names:
                 found.append((a.name, node.lineno))
         elif isinstance(node, ast.ImportFrom):
@@ -125,14 +150,15 @@ def python_imports(source, path: str = "") -> list[tuple[str, int]]:
     return found
 
 
-def generic_imports(source: str, path: str = "") -> list[tuple[str, int]]:
+def generic_imports(source: str, path: str = "",
+                    resolve_js=None) -> list[tuple[str, int]]:
     """(module, line_no) for a non-Python source file; the language comes
     from `path`'s extension (JavaScript/TypeScript when there is none)."""
-    return langs.extract(path, source)
+    return langs.extract(path, source, resolve_js=resolve_js)
 
 
 def extract_imports(path: str, source=None, strict_py_only: bool = False,
-                    diag=None, go_module: str = ""
+                    diag=None, go_module: str = "", resolver=None
                     ) -> tuple[list[tuple[str, int]], str]:
     """Returns (imports, engine) where engine is "ast", "regex", or "none".
 
@@ -142,6 +168,9 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
     stderr when there is none - because it must not silently pass every
     import rule. `go_module` is the module path from go.mod: Go imports of
     the repo's own packages are returned relative to the repo root.
+    `resolver` (resolve.Resolver) adds what only the repository's config
+    files can say: tsconfig aliases, workspace packages, the nearest go.mod,
+    composer psr-4 namespaces.
     """
     ext = os.path.splitext(path)[1].lower()
     if source is None:
@@ -167,12 +196,20 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
             return [], "ast"
     if ext in GENERIC_EXTS and not strict_py_only:
         try:
-            imports = generic_imports(decode_source(path, source), path)
+            imports = generic_imports(
+                decode_source(path, source), path,
+                resolver.js if resolver is not None else None)
         except (RecursionError, MemoryError, langs.ExtractionLimit) as e:
             unparsable(langs.LANG_NAMES[langs.language_of(path)], e)
             return [], "regex"
         if ext == ".go":
-            imports = langs.strip_go_module(imports, go_module)
+            if resolver is not None:
+                imports = [(resolver.go(path, m), n) for m, n in imports]
+            else:
+                imports = langs.strip_go_module(imports, go_module)
+        elif ext == ".php" and resolver is not None:
+            extra = [(r, n) for m, n in imports for r in resolver.php(path, m)]
+            imports = imports + extra
         return imports, "regex"
     return [], "none"
 

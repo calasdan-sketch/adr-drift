@@ -226,3 +226,11 @@ def repo_prefix(root: str) -> str:
     except GitError:
         return ""
     return out.decode("utf-8", "surrogateescape").strip().rstrip("/")
+
+
+def tree_paths(root: str, ref: str = "HEAD") -> "list[str]":
+    """Every file path in the commit `ref`, relative to `root` (the working
+    directory of the check: inside a monorepo package that is the package).
+    `drift` uses it to know which files a layer glob can reach."""
+    out = _run(root, "ls-tree", "-r", "-z", "--name-only", ref)
+    return [p.decode("utf-8", "replace") for p in out.split(b"\0") if p]

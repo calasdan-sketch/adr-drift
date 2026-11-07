@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.3.0 - unreleased
+
+Expert round 2: the rule vocabulary, import resolution and governance that
+the panel (an ADR maintainer, an architecture-fitness engineer, a polyglot
+monorepo engineer, a CI lead, a governance lead and a skeptical tech lead)
+found missing. Benchmark on a generated seven-language corpus
+(`benchmarks/`): recall 63.2% -> 100%, precision 85.8% -> 100%.
+
+Added
+- Import resolution from the repository's own config (`resolve.py`):
+  TypeScript/JavaScript `compilerOptions.paths` and `baseUrl` from the
+  nearest tsconfig.json / jsconfig.json (JSON with comments, `extends`
+  followed, an unreadable file is a warning), monorepo workspace packages
+  (`workspaces` in package.json, `pnpm-workspace.yaml`), the nearest `go.mod`
+  for Go (monorepos with several modules), composer `psr-4` for PHP.
+- Python `importlib.import_module("m")`, `import_module("m")` and
+  `__import__("m")` with a literal absolute name are imports.
+- Rules: `layer-order: a > b > c`, `only-import: <layer> -> x, y`,
+  `public-api: <layer> -> module[, module]`; in arch.yaml and ADRs, in
+  `check`, `baseline` and `drift`, with SARIF ids and the usual warnings for
+  a layer that does not exist.
+- `waivers:` in arch.yaml: a rule, optional path globs, an owner, an end date
+  and a reason, all required; expired waivers bring the violations back and
+  name the owner; stale, soon-ending and over-a-year waivers warn.
+  `ADR_DRIFT_TODAY` pins the date.
+- `--format markdown` for `check` and `drift`: a pull-request comment with the
+  ADR behind each broken rule (title, status, deciders, the decision), the
+  offending lines and their CODEOWNERS owners; escaped, capped at 60 000
+  characters.
+- `adr-drift coverage [--fail-under PERCENT] [--format json]`: which ADRs in
+  force enforce no rule, ADRs that mention paths that no longer exist, the
+  waivers; exit 1 under the threshold or with an expired waiver.
+- `check --baseline FILE --ratchet`: exit 1 while a fixed violation is still
+  in the baseline.
+- `--jobs N` for `check` and `baseline`: files are read in N processes (default
+  one per CPU up to 8; repositories under 1 500 files use one). The output is
+  the same for any N. Pattern-rule file contents are no longer kept in memory
+  when no pattern rule exists.
+- `benchmarks/`: a seeded multi-language corpus with ground truth
+  (`gen_corpus.py`), precision/recall/speed (`bench.py`), and a comparison with
+  import-linter, tach and dependency-cruiser (`compare.py`); the corpus is a
+  regression test (`tests/test_benchmark.py`).
+
+Changed
+- A layer glob with a wildcard directory in the middle or at the start
+  (`src/**/db/**`, `**/db/**`) is now matched against the file an import
+  names. Before, `src/**/db/**` made every module under `src` a member of the
+  layer (false alarms) and `**/db/**` matched no import at all (missed
+  violations). **This can add or remove violations in repositories that use
+  such globs.** `drift` reads the file list at HEAD for it.
+- Go imports use the nearest `go.mod`, not only the root one.
+- `Loaded` gained `waivers`; parsed ADRs gained `owners`, `decision` and
+  `code_refs`; `engine.check` gained `jobs`; `engine.evaluate` gained
+  `repo_paths`; `engine.split_baseline` (`not_baselined` keeps working).
+
 ## 0.2.0 - unreleased
 
 Added

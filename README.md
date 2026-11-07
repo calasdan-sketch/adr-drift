@@ -7,14 +7,21 @@ Ruby and PHP, with no dependencies beyond the Python standard library.
 
 - Rules live in your ADRs (`## Constraints`) or in `arch.yaml`; a superseded,
   deprecated or rejected ADR stops being enforced, and says so.
-- Layer imports, forbidden or required code patterns, and dependency cycles
-  between layers.
+- Layer imports, layer order, allow-lists, public-API boundaries, forbidden
+  or required code patterns, and dependency cycles between layers.
+- Resolves what the import statement does not say: tsconfig `paths` and
+  `baseUrl`, monorepo workspace packages, the nearest `go.mod`, composer
+  PSR-4 namespaces, `importlib.import_module("literal")`.
 - Fails closed: a rule that does not parse, a glob that matches nothing or a
   repo with no rules is an error or a warning, never a silent pass.
-- Grandfather legacy violations (`baseline`), or check only what a pull
-  request introduced (`drift`).
+- Grandfather legacy violations (`baseline`, with a `--ratchet` so the
+  baseline only shrinks), check only what a pull request introduced
+  (`drift`), or waive a rule for a path with an owner and an end date.
 - CI-native output: GitHub annotations on the offending line
-  (`--format github`), SARIF for code scanning (`--format sarif`), JSON.
+  (`--format github`), SARIF for code scanning (`--format sarif`), JSON, and
+  a pull-request comment (`--format markdown`) that quotes the ADR behind
+  each broken rule, who decided it and who owns the files.
+- `adr-drift coverage` lists the ADRs that enforce nothing.
 
 ```console
 $ adr-drift --root tests/fixtures/shop check      # the example repo in this repository
@@ -52,9 +59,10 @@ pip install git+https://github.com/calasdan-sketch/adr-drift   # the latest code
 
 Either provides `adr-drift`; Python 3.10+ and nothing else. Or run without
 installing: `python3 -m adr_drift` from the repo root. This README describes
-0.2.0, which is not on PyPI yet (see [CHANGELOG.md](CHANGELOG.md)): until it
-is, `forbid-cycles`, `--format github|sarif` and retired ADRs need the
-second line.
+0.3.0, which is not on PyPI yet (see [CHANGELOG.md](CHANGELOG.md)): until it
+is, everything below that is newer than the released version (cycles,
+`--format github|sarif|markdown`, retired ADRs, the layer rules, waivers,
+`coverage`, alias resolution) needs the second line.
 
 ## Quick start
 
@@ -73,8 +81,9 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 | Command | What it does |
 |---|---|
 | `init` | Infer layers from folder layout, write `arch.yaml` + sample ADR + index (a `README.md` of yours is kept) |
-| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules) |
-| `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` |
+| `check` | Verify the repo against `arch.yaml` + every ADR's `## Constraints` (`--baseline FILE` grandfathers recorded violations; `--strict` fails on warnings; `--allow-empty` accepts a repo with no rules; `--ratchet` also fails when a baselined violation was fixed; `--jobs N` reads files in N processes) |
+| `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` (violations covered by a live waiver are left out) |
+| `coverage` | Which ADRs in force enforce a rule, which name paths that no longer exist, and the waivers (`--fail-under PERCENT`; exit 1 on an expired waiver) |
 | `drift --since HEAD~5` | Report violations *introduced* between a git ref and `HEAD`, plus violations *fixed* in that range (pre-existing ones ignored) |
 | `new "title"` | Create the next-numbered ADR from a template |
 | `index` | Regenerate the ADR index (`docs/adr/README.md`); a `README.md` adr-drift did not write is left alone unless you pass `--force` |
@@ -93,6 +102,9 @@ forbid-import: handlers -> db.drivers     # layering: handlers may not import dr
 forbid-pattern: src/**.py !~ \beval\(     # no eval() anywhere in src/
 require-pattern: src/handlers/**.py =~ authenticate\(   # handlers must authenticate
 forbid-cycles: *                          # no two layers depend on each other in a loop
+layer-order: handlers > services > db     # a layer imports only layers to its right
+only-import: util -> util                 # util may import no other layer of this repo
+public-api: db -> db.api, db.models       # outside db, import only these modules
 ```
 
 `forbid-cycles: <layers>` covers the layers of `arch.yaml` whose name matches
@@ -116,6 +128,17 @@ In `arch.yaml` quote it (`- "forbid-cycles: *"`): unquoted, YAML reads `*` as
 an alias and adr-drift says so. A pattern that covers fewer than two layers
 is a warning.
 
+`layer-order: a > b > c` lists layers highest first; importing a layer that
+is higher than the file's own is a violation (skipping a level is fine, and
+layers not in the list are free). `only-import: <layer> -> x, y` is an
+allow-list over the layers of `arch.yaml`: the layer may import its own
+files and layers `x` and `y`; libraries and the standard library are not
+restricted (use `forbid-import` for those). `public-api: <layer> -> m1, m2`
+says code outside the layer may import only the named modules of it (and
+`from db import api` counts as importing `db.api`). Each takes a layer
+name that must exist in `arch.yaml` (a misspelt one is a warning, and
+`--strict` makes it an error). They work in `check`, `baseline` and `drift`.
+
 `from`/`to` match layer names or module prefixes (`db.drivers` matches
 `db.drivers.pg`); `*` wildcards supported. Comments start with `#`.
 Python relative imports resolve against the file's package
@@ -129,6 +152,67 @@ spells the import: a `db` layer mapped to `src/myapp/db/**` is reached by
 and, in a flat layout, `import db.conn` - a rule naming the layer (`db`) or
 any of those spellings matches all of them. Only the layer's leading
 directories are stripped, never its own, so `conn` alone matches nothing.
+
+A layer glob with a wildcard directory in the middle (`src/**/db/**`) or at
+the start (`**/db/**`) is matched against the file the import names, not as
+a prefix: an import counts as in the layer only when it names a file or
+directory of the repository that the glob covers (so `github.com/other/lib/db`
+is not in `**/db/**`). Before 0.3.0 such a glob made every module under its
+literal prefix a member and `**/db/**` matched nothing.
+
+### Waivers: an exception with an owner and an end date
+
+A baseline hides a violation for ever. A waiver hides it until a date:
+
+```yaml
+# arch.yaml
+waivers:
+  - rule: "handlers must not import db"      # exactly as `check` prints it
+    paths: ["src/handlers/legacy/**"]        # optional; default: every file
+    owner: alice
+    expires: 2027-03-31                      # the last day it applies
+    reason: "billing migration, ticket 123"
+```
+
+`rule`, `owner`, `expires` and `reason` are required, `expires` must be a
+real date, and a `rule` that no enforced rule says is an error (exit 2),
+so a typo cannot waive nothing and look like a waiver. Until the end date
+the covered violations are left out of the report (a `note:` on stderr
+says how many and whose). After it they are reported again and a warning
+names the owner; a waiver that matches no violation (the code was fixed) is
+reported as stale, one that ends within 14 days, and one that runs more
+than a year, are called out - `--strict` turns each warning into exit 2.
+`adr-drift coverage` lists all waivers. Waivers live in `arch.yaml`, so put
+`arch.yaml` under CODEOWNERS: anyone who can edit it can waive a rule.
+`ADR_DRIFT_TODAY=2027-01-01` pins "today" (for tests and replays).
+
+### The ratchet
+
+`adr-drift check --baseline .adr-baseline.json --ratchet` also fails (exit 1)
+when a violation listed in the baseline no longer exists: run `adr-drift
+baseline`, commit it, and the fixed violation cannot silently return. The
+count of grandfathered violations can then only go down.
+
+### Which ADRs enforce anything
+
+```console
+$ adr-drift coverage
+1 of 2 ADRs in force enforce at least one rule (50%)
+  ✓ docs/adr/0001-layers.md  accepted  1 rule  [Alice, Bob]
+  ✗ docs/adr/0002-no-secrets.md  Accepted  0 rules
+      nothing checks this decision: add a ## Constraints section
+      hint: the decision reads like a rule ('must not', 'never'...); ...
+      mentions config/vault, which does not exist
+```
+
+A decision that is in force (anything but superseded, deprecated or
+rejected) with no rule is a decision nothing checks. `--fail-under 80` makes
+that a CI gate; `--format json` is for dashboards. Owners come from the ADR
+(`deciders:` / `owner:` in the front matter, or an `Owner:` / `Deciders:` line
+under the title). The hint is a keyword heuristic (`must not`, `never`...),
+not a judgement. "Mentions ... which does not exist" is any `` `path/like/this` ``
+in the ADR that is not in the repository: a decision pointing at code that
+moved.
 
 ### Where the ADRs are
 
@@ -273,16 +357,17 @@ and rule.
 
 `forbid-import` needs to know a file's imports. Python is exact (`ast`:
 `import x`, `import x.y as z`, `from x import y`, relative imports resolved
-against the file's package; `importlib` and `__import__` calls are not
-seen). The rest is a heuristic extractor - read what it covers:
+against the file's package; `importlib.import_module("m")`, `import_module("m")`
+and `__import__("m")` with a literal absolute name count too, a computed name
+or a method of some other object does not). The rest is a heuristic extractor - read what it covers:
 
 | Language | Files | Recognised | Not recognised |
 |---|---|---|---|
-| JavaScript / TypeScript | `.js .jsx .ts .tsx .mjs .cjs` | `import x from "m"`, `import { a, b } from "m"` (also over several lines), `import * as ns from "m"`, `import type ... from "m"`, `import "m"`, `export ... from "m"`, `export * from "m"`, `import("m")`, `require("m")`, `import x = require("m")`; relative specifiers resolve against the file | path aliases (tsconfig `paths`, bundler aliases), non-literal `import(x)` / `require(x)`, `.vue` / `.svelte` files |
-| Go | `.go` | `import "m"`, aliased / `.` / `_` imports, grouped `import ( ... )`, raw-string paths; the module path in the root `go.mod` is removed from the repo's own packages (`github.com/acme/app/internal/db` is `internal/db`) | a `go.mod` below the root (multi-module repos), build tags |
+| JavaScript / TypeScript | `.js .jsx .ts .tsx .mjs .cjs` | `import x from "m"`, `import { a, b } from "m"` (also over several lines), `import * as ns from "m"`, `import type ... from "m"`, `import "m"`, `export ... from "m"`, `export * from "m"`, `import("m")`, `require("m")`, `import x = require("m")`; relative specifiers resolve against the file; tsconfig/jsconfig `paths` and `baseUrl` (`extends` followed), and workspace packages (`workspaces` in the root package.json, `pnpm-workspace.yaml`), resolve to their directory | bundler aliases (webpack, vite), tsconfig `references` and `extends` of a package, non-literal `import(x)` / `require(x)`, `.vue` / `.svelte` files |
+| Go | `.go` | `import "m"`, aliased / `.` / `_` imports, grouped `import ( ... )`, raw-string paths; the module path of the nearest `go.mod` is replaced by that module's directory (`github.com/acme/app/internal/db` in `svc/` is `svc/internal/db`) | `go.work`, build tags |
 | Java | `.java` | `import a.b.C;`, `import static a.b.C.m;`, wildcards (`a.b.*` is `a.b`) | uses of a class in the same package (there is no import), fully qualified names in code |
 | Rust | `.rs` | `use a::b;`, nested trees `use a::{b::{c, d}, e as f, self}`, globs, `pub use`, `pub(crate) use`, `extern crate`, `mod x;`; `crate::`, `self::` and `super::` resolve against the file's module | macro-generated `use`, `#[path = "..."]` modules, paths used in code without a `use` |
-| PHP | `.php` | `use A\B;`, `use A\{B, C as D}`, `use function` / `use const`, `require` / `include` (`_once`) of a literal path or `__DIR__ . 'path'` | `dirname(__FILE__)`, dynamic includes, a namespace spelt in a different case than its directory |
+| PHP | `.php` | `use A\B;`, `use A\{B, C as D}`, `use function` / `use const`, `require` / `include` (`_once`) of a literal path or `__DIR__ . 'path'`; composer `autoload` / `autoload-dev` `psr-4` maps a namespace to its directory | `dirname(__FILE__)`, dynamic includes, classmap / PSR-0 autoloading, a namespace spelt in a different case than its directory without a psr-4 entry |
 | Ruby | `.rb` | `require`, `require_relative`, `load`, `autoload` with a string literal, at the start of a line | a `require` after other code on the same line, computed paths |
 
 Rust and PHP names are matched dotted (`crate::db::x` is `db.x`,
@@ -314,6 +399,7 @@ error goes to stderr as `warning: ...` / `error: ...`.
 | `human` (default) | the report above |
 | `json` | a bare JSON array; each item has `rule`, `rule_source`, `file`, `line`, `detail` (and `evidence` for a cycle) |
 | `github` | one GitHub Actions `::error` annotation per violation (on its file and line) and one `::warning` per warning, then the human report |
+| `markdown` | a pull-request comment: for each broken rule, the ADR it comes from (title, status, who decided it, the decision in a sentence), then a table of the offending lines with their CODEOWNERS owners; at most 25 rows per rule and 60 000 characters; everything from the repository is escaped (no link, tag or @-mention can come out of an ADR) |
 | `sarif` | a SARIF 2.1.0 log for GitHub code scanning; each rule gets a stable id, each result a fingerprint that ignores the line number (the same identity `check --baseline` uses) |
 
 Everything printed for people - paths, module names, ADR statuses - comes
@@ -385,6 +471,28 @@ steps:
       sarif_file: adr-drift.sarif
 ```
 
+A comment on the pull request that names the ADR and the owners (needs
+`pull-requests: write`; a pull request from a fork gets a read-only token,
+so the comment step cannot post there; not run on GitHub by the author of
+this change - treat the snippet as a starting point):
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+steps:
+  - uses: actions/checkout@v4
+  - run: pip install adr-drift
+  - id: drift
+    run: adr-drift check --format markdown > drift.md
+    continue-on-error: true
+  - if: github.event_name == 'pull_request'
+    run: gh pr comment "$PR" --body-file drift.md
+    env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}" }
+  - if: steps.drift.outcome == 'failure'
+    run: exit 1
+```
+
 [pre-commit](https://pre-commit.com): this repository ships a hook.
 
 ```yaml
@@ -407,9 +515,56 @@ pull request compare against where the branch left the base:
 
 ## How it compares
 
-Checked on 2026-11-06 against each project's own pages (linked); the cells
-say only what those pages say - corrections welcome. Where those tools are
-stronger, the table says so.
+### Measured (re-runnable)
+
+Two benchmarks ship in [`benchmarks/`](benchmarks/) and use only the
+command line.
+
+**1. Detection on a generated polyglot corpus** (`python3
+benchmarks/bench.py`): 350 handler files in seven languages (Python,
+TypeScript, Go, Java, Rust, PHP, Ruby; a tsconfig alias, a `go.mod` below the
+root, PSR-4, layer globs with a wildcard in the middle, ...), 497 planted
+violations of one rule written in an ADR, and decoys: the same import in a
+comment, in a string, `db_utils` next to `db`, an import of another module
+that happens to share a name. The generator is seeded and knows nothing about
+adr-drift, but I chose its categories - they are the spellings I know real
+code uses, not a sample of real repositories.
+
+| | planted found (recall) | reported lines that are real (precision) | 20 000 files, 2 CPUs |
+|---|---|---|---|
+| adr-drift 0.2.0 (before this round) | 63.2% (314 / 497) | 85.8% (52 false alarms) | 1.9 s, 53 MB (one process) |
+| adr-drift 0.3.0 | 100% (497 / 497) | 100% (0 false alarms) | 1.9 s, 70 MB (2 processes); 2.3 s with `--jobs 1` |
+
+It is a regression gate too (`tests/test_benchmark.py`). Do not read 100% as
+"finds everything": it is 100% of what the generator plants. Not planted, so
+not measured: computed `import(x)`, bundler aliases, `.vue` / `.svelte`,
+tsconfig `references`, macro-generated Rust.
+
+**2. The same project, other tools** (`python3 benchmarks/compare.py`, which
+skips a tool that is not installed): one valid Python project and one
+TypeScript project with a tsconfig alias, 2 500 handler files each, one
+violation planted in each file. 2026-11-07, import-linter 2.16 (grimp 3.19),
+tach 0.35.3, dependency-cruiser 18.7.2, Python 3.13, 2 CPUs.
+
+| tool | what it was asked | found | false alarms | missed | time |
+|---|---|---|---|---|---|
+| adr-drift 0.3.0 | `handlers` must not import `db` (Python + TS in one run) | 2 500 / 2 500 (Python), 2 500 / 2 500 (TS) | 0 | - | 1.3 s for both (17 500 files) |
+| import-linter | forbidden contract, Python | 2 143 / 2 500 | 0 | `importlib.import_module("db.m")` | 1.0 s |
+| tach | `handlers` does not depend on `db` | 1 786 / 2 500 | 0 | `importlib` calls and `if TYPE_CHECKING:` imports (tach ignores these by default; unverified that it is a documented choice) | 0.5 s |
+| dependency-cruiser | forbidden rule, tsconfig alias | 2 500 / 2 500 files (reports files, not lines) | 0 | - | 4.4 s |
+
+Read it plainly: on plain static imports these tools tie. adr-drift's edge
+here is the dynamic `importlib` literal and one config for several
+languages; it is **not** faster than tach, which read the 7 500 Python files in 0.5 s
+while adr-drift took 1.3 s for those and the TypeScript files together
+(2 CPUs, and the machine was shared: expect noise). A run on your repository, your layout and your
+rules is worth more than this table.
+
+### Features
+
+Checked on 2026-11-06 and 2026-11-07 against each project's own pages
+(linked); the cells say only what those pages say - corrections welcome.
+Where those tools are stronger, the table says so.
 
 | | adr-drift | [import-linter](https://import-linter.readthedocs.io/en/stable/contract_types/) | [Tach](https://github.com/tach-org/tach) | [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) | [deptrac](https://deptrac.github.io/deptrac/formatters) |
 |---|---|---|---|---|---|
@@ -417,19 +572,29 @@ stronger, the table says so.
 | Where the rules live | your ADRs and `arch.yaml` | its own config (INI / TOML) | `tach.toml` | its own config file | its own config (unverified) |
 | Code patterns (forbid / require a regex) | yes | not on the linked page | not on the linked page | not on the linked page | not on the linked page |
 | Dependency cycles | between layers | `acyclic_siblings` contract | yes | yes (`--init` adds the rule) | not on the linked page |
-| Other contract types | - | protected, independence, layers | interfaces, deprecated deps, ownership | orphans, missing / dev-only package.json deps | - |
-| Grandfathering / adoption | `baseline` + `drift` | not on the linked page | "incremental adoption" | not described on the README | `--formatter=baseline` |
-| CI output | human, JSON, GitHub annotations, SARIF | not on the linked page | terminal, DOT, JSON | err, dot, html, mermaid, json, csv | table, GitHub Actions, JUnit, Code Climate, JSON, Graphviz, Mermaid |
+| Layer order / allow-lists / public API | `layer-order`, `only-import`, `public-api` | layers, independence, protected contracts | interfaces, `depends_on` | `forbidden` rules by path | - |
+| Other contract types | - | protected, independence | deprecated deps, ownership | orphans, missing / dev-only package.json deps | - |
+| Rule waivers with owner and expiry | yes (`waivers`) | not on the linked page | not on the linked page | not on the linked page | not on the linked page |
+| Grandfathering / adoption | `baseline` (+ `--ratchet`) + `drift` | not on the linked page | "incremental adoption" | not described on the README | `--formatter=baseline` |
+| Reads decision records, reports which ADRs enforce nothing | yes (`coverage`) | no | no | no | no |
+| CI output | human, JSON, GitHub annotations, SARIF, PR comment (Markdown) | not on the linked page | terminal, DOT, JSON | err, dot, html, mermaid, json, csv | table, GitHub Actions, JUnit, Code Climate, JSON, Graphviz, Mermaid |
 | Graph pictures | no | not on the linked page | yes (DOT, web) | yes (dot, mermaid, html) | yes (Graphviz, Mermaid) |
 | Install footprint | Python stdlib only | Python package | Rust-built Python package | Node.js package | PHP package |
 
+Also relevant, not compared cell by cell: [ArchUnit](https://www.archunit.org/)
+(Java and Kotlin tests with the richest rule vocabulary I know of),
+[pytest-archon](https://github.com/jwbargsten/pytest-archon) (architecture
+rules as pytest tests), [deptry](https://github.com/fpgmaas/deptry) (checks
+declared against imported third-party packages - a different problem).
+
 What they do better: import-linter has more contract kinds and a real
 import graph; Tach also checks that modules use each other's public
-interface and has a VS Code extension; dependency-cruiser resolves real
-module paths (tsconfig aliases included) and draws the graph; deptrac
-emits more report formats. adr-drift is the one that reads the decision
-records themselves, spans languages in one config, and checks code
-patterns.
+interface, is faster and has a VS Code extension; dependency-cruiser resolves
+real module paths (webpack and tsconfig aliases) and draws the graph;
+deptrac emits more report formats; ArchUnit understands the language's type
+system, not just imports. adr-drift is the one that reads the decision
+records themselves, spans languages in one config, checks code patterns,
+and keeps waivers and the baseline honest.
 
 ## Limitations
 
@@ -440,8 +605,8 @@ patterns.
   a warning).
 - Python is exact; every other language is a heuristic extractor (see
   *Languages: exact support*): path aliases, computed paths and macros are
-  not seen. In Python, `importlib.import_module()` and `__import__()` are not
-  seen either; every `import` statement counts, also inside functions and
+  not seen. In Python, `importlib.import_module(name)` with a computed name is not
+  seen; every `import` statement counts, also inside functions and
   `if TYPE_CHECKING:` blocks.
 - `forbid-pattern` is matched line by line (it cannot span lines);
   `require-pattern` searches the whole file.
@@ -458,7 +623,9 @@ patterns.
 - `drift` compares `HEAD` with the ref itself, not with the merge base, and
   ignores uncommitted edits. It needs a git repository with enough history;
   `check` works anywhere.
-- Go: only the `go.mod` at the repo root is read.
+- Go: the nearest `go.mod` is read, `go.work` is not. Config files are read
+  from the working tree, also by `drift` (a tsconfig changed in the range is
+  not compared).
 - Windows: files are always read and written as UTF-8, and on a console that
   can't show the check marks (cp1252 pipes) the report falls back to
   `[ok]`/`[x]`.
@@ -468,6 +635,10 @@ patterns.
 ## Tests
 
 `python3 -m unittest discover -s tests` (or `python -m pytest -q`)
+
+`python3 benchmarks/bench.py` re-runs the detection and speed benchmark;
+`python3 benchmarks/compare.py` runs the tools above on one project (see
+[benchmarks/README.md](benchmarks/README.md)).
 
 ## License
 

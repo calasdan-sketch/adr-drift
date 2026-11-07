@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import fnmatch
+import functools
 import os
 import re
 
 from . import config as config_mod
 from . import diag as diag_mod
 from . import langs
+from . import resolve as resolve_mod
 from . import rules as rules_mod
 from . import scanner as scanner_mod
 
@@ -90,31 +93,48 @@ def new_and_fixed(base: "list[Violation]", now: "list[Violation]",
     return [now[i] for i in extra_now], [base[j] for j in extra_base]
 
 
-def not_baselined(violations: "list[Violation]",
-                  entries: "list[dict]") -> "list[Violation]":
-    """The violations a baseline (`adr-drift baseline`) does not cover.
+def split_baseline(violations: "list[Violation]", entries: "list[dict]"
+                   ) -> "tuple[list[Violation], list[dict]]":
+    """(the violations a baseline does not cover, the baseline entries that
+    no longer match any violation).
 
     Entries match by identity, not line, so editing above a grandfathered
     violation does not resurrect it. An entry without `detail` (hand-made)
-    can only match by exact file, line and rule.
+    can only match by exact file, line and rule. The second list is what
+    `check --ratchet` fails on: a violation that was fixed but is still
+    listed would let the same violation back in unnoticed.
     """
     legacy: collections.Counter = collections.Counter()
+    legacy_entries: dict = collections.defaultdict(list)
     known: list = []
+    known_entries: list = []
     for e in entries:
         line = e.get("line") if isinstance(e.get("line"), int) else 0
         if isinstance(e.get("detail"), str):
             known.append(((e["file"], e["rule"], e["detail"]), line))
+            known_entries.append(e)
         else:
-            legacy[(e["file"], line, e["rule"])] += 1
+            key = (e["file"], line, e["rule"])
+            legacy[key] += 1
+            legacy_entries[key].append(e)
     remaining: list[Violation] = []
     for v in violations:
         key = (v.file, v.line, v.rule.describe())
         if legacy[key] > 0:
             legacy[key] -= 1
+            legacy_entries[key].pop()
         else:
             remaining.append(v)
-    extra, _gone = _unpaired([(identity(v), v.line) for v in remaining], known)
-    return [remaining[i] for i in extra]
+    extra, gone = _unpaired([(identity(v), v.line) for v in remaining], known)
+    stale = [known_entries[j] for j in gone]
+    stale += [e for es in legacy_entries.values() for e in es]
+    return [remaining[i] for i in extra], stale
+
+
+def not_baselined(violations: "list[Violation]",
+                  entries: "list[dict]") -> "list[Violation]":
+    """The violations a baseline (`adr-drift baseline`) does not cover."""
+    return split_baseline(violations, entries)[0]
 
 
 def _rel(root: str, path: str) -> str:
@@ -129,26 +149,117 @@ def _file_layer(layers: list[dict], rel_path: str) -> str:
     return ""
 
 
+def _split_pattern(pat: str) -> "tuple[list[str], list[str]]":
+    """A layer path glob as (its literal leading directories, the rest)."""
+    lit: list[str] = []
+    parts = pat.replace("\\", "/").strip("/").split("/")
+    for i, part in enumerate(parts):
+        if any(ch in part for ch in "*?["):
+            return lit, parts[i:]
+        lit.append(part)
+    return lit, []
+
+
 def _layer_path_prefixes(layer: dict) -> list[str]:
     """Dotted module prefixes implied by a layer's path globs.
 
     Only the literal leading components count (up to the first
     wildcard): "src/db/**" -> ["src.db"], "handlers/**" -> ["handlers"].
+    A glob with a wildcard directory and more after it ("src/**/db/**",
+    "**/db/**") is not a prefix: see _complex_globs().
     """
     prefixes: list[str] = []
     for pat in layer.get("paths", []):
-        lit: list[str] = []
-        for part in pat.replace("\\", "/").strip("/").split("/"):
-            if any(ch in part for ch in "*?["):
-                break
-            lit.append(part)
-        if lit:
+        lit, rest = _split_pattern(pat)
+        if lit and len(rest) < 2:
             prefixes.append(".".join(lit))
     return prefixes
 
 
-def _import_identities(mod: str, layers: list[dict]) -> list[str]:
-    """Every name an imported module can be known by.
+def _complex_globs(layer: dict) -> list[str]:
+    """The layer's globs that no prefix describes: a wildcard directory
+    followed by more path ("src/**/db/**"). Treating "src" as the layer's
+    prefix would call every module under src a member (and "**/db/**" has
+    no prefix at all), so a module is tested against the glob itself."""
+    return [pat for pat in layer.get("paths", [])
+            if len(_split_pattern(pat)[1]) >= 2]
+
+
+#: The extensions a module's file can have: a module is tried against a
+#: layer's glob as <path>, <path>.<ext> and <path>/x.<ext> (a package).
+_MODULE_EXTS = tuple(sorted(scanner_mod.PY_EXTS | scanner_mod.GENERIC_EXTS))
+
+
+def known_suffixes(paths) -> "dict[str, list[str]]":
+    """{dotted name: [paths]} for every name by which a file or directory
+    of the repo can be reached from the end of its path: src/db/conn.py is
+    `conn`, `db.conn` and `src.db.conn`, and the directory src/db (listed
+    with a trailing "/") is `db` and `src.db`. An import that is none of
+    these (up to a member name) is not about this repo."""
+    out: "dict[str, list[str]]" = {}
+    done: "set[str]" = set()
+
+    def add(parts: "list[str]", rep: str) -> None:
+        for i in range(len(parts)):
+            out.setdefault(".".join(parts[i:]), []).append(rep)
+
+    for rel in paths:
+        parts = rel.replace("\\", "/").split("/")
+        parts[-1] = parts[-1].rsplit(".", 1)[0]
+        add(parts, rel)
+        for d in range(1, len(parts)):
+            key = "/".join(parts[:d])
+            if key not in done:
+                done.add(key)
+                add(parts[:d], key + "/")
+    return out
+
+
+@functools.lru_cache(maxsize=1024)
+def _glob_matcher(glob: str):
+    """rules.match_glob(glob, path) as a compiled regex's match method."""
+    g = glob.replace("\\", "/")
+    alts = [fnmatch.translate(g)]
+    if "**" in g:
+        alts.append(fnmatch.translate(g.replace("**/", "")))
+    return re.compile("|".join(alts), re.DOTALL).match
+
+
+def _glob_hits_module(glob: str, mod: str,
+                      known: "dict[str, list[str]]") -> bool:
+    """Is `mod` something in the repo that `glob` covers? It must name a
+    file (optionally followed by up to two member names: com.acme.db.Conn
+    .open) or a directory (followed by at most one: `from db import name`);
+    the glob is then tried on that file, or inside that directory."""
+    pieces = rules_mod._norm(mod).split(".")
+    match = _glob_matcher(glob)
+    for n in range(len(pieces), max(0, len(pieces) - 3), -1):
+        extra = pieces[n:]
+        for rep in known.get(".".join(pieces[:n]), ()):
+            if rep.endswith("/"):
+                if len(extra) > 1:
+                    continue
+                base = rep + "/".join(extra)
+                if match(base) or any(match(base + "/x" + ext)
+                                      for ext in _MODULE_EXTS):
+                    return True
+            elif match(rep):
+                return True
+    return False
+
+
+def _in_glob(pat: str, mod: str) -> bool:
+    path = rules_mod._norm(mod).replace(".", "/")
+    if rules_mod.match_glob(pat, path):
+        return True
+    return any(rules_mod.match_glob(pat, path + ext)
+               or rules_mod.match_glob(pat, path + "/x" + ext)
+               for ext in _MODULE_EXTS)
+
+
+class IdentityIndex:
+    """Every name an imported module can be known by, for many modules
+    against one list of layers.
 
     Besides the literal module ("myapp.db.conn") this includes the layer
     name(s) whose paths contain it ("db") and the module spelt with the
@@ -158,42 +269,25 @@ def _import_identities(mod: str, layers: list[dict]) -> list[str]:
     import root), by `import src.myapp.db.conn` and, for a flat layout,
     by `import db.conn`: without this the rule naming the layer silently
     never fires for the spelling the code actually uses.
-    """
-    ids = [mod]
-    dotted = mod.replace("/", ".").strip(".")
-    for layer in layers:
-        name = layer.get("name", "")
-        for prefix in _layer_path_prefixes(layer):
-            parts = prefix.split(".")
-            for k in range(len(parts)):
-                # the layer's path with its first k directories stripped
-                if not rules_mod.match_pat(".".join(parts[k:]), mod):
-                    continue
-                if name and name not in ids:
-                    ids.append(name)
-                canonical = (parts[:k] + dotted.split("."))
-                for j in range(len(parts)):  # never strips the layer's own dir
-                    form = ".".join(canonical[j:])
-                    if form and form not in ids:
-                        ids.append(form)
-                break
-    return ids
 
+    The layers' path prefixes are indexed once (by every suffix that may
+    match), so a module costs one dictionary look-up per dotted prefix of
+    its own name instead of a pass over every layer, and each module is
+    worked out once: O(imports * depth), not O(imports * layers). A layer
+    glob that is not a prefix ("src/**/db/**", "**/db/**") is tested
+    against the module as a path instead (once per module and glob), and,
+    when `known` (known_suffixes() of the repo's files) is given, only a
+    module that names something in the repo can be in it - an import of
+    github.com/other/lib/db is not in a layer "**/db/**"."""
 
-class IdentityIndex:
-    """_import_identities() for many modules against one list of layers,
-    without its cost: the layers' path prefixes are indexed once (by every
-    suffix _import_identities() tries), so a module costs one dictionary
-    look-up per dotted prefix of its own name instead of a pass over every
-    layer, and each module is worked out once. A repo with L layers and N
-    imports was O(N * L); it is now about O(N * depth). Same answers, in the
-    same order, as _import_identities() (tests compare the two)."""
-
-    def __init__(self, layers: list[dict]):
+    def __init__(self, layers: list[dict],
+                 known: "dict[str, list[str]] | None" = None):
         self._layers = layers
+        self._known = known
         # suffix -> [(layer index, prefix index, k)], k ascending per prefix
         self._by_suffix: dict = collections.defaultdict(list)
         self._parts: dict = {}
+        self._complex: "list[tuple[int, str]]" = []
         for li, layer in enumerate(layers):
             for pi, prefix in enumerate(_layer_path_prefixes(layer)):
                 parts = prefix.split(".")
@@ -201,6 +295,7 @@ class IdentityIndex:
                 for k in range(len(parts)):
                     key = rules_mod._norm(".".join(parts[k:]))
                     self._by_suffix[key].append((li, pi, k))
+            self._complex.extend((li, g) for g in _complex_globs(layer))
         self._cache: dict = {}
 
     def of(self, mod: str) -> "list[str]":
@@ -227,8 +322,23 @@ class IdentityIndex:
                 form = ".".join(canonical[j:])
                 if form and form not in ids:
                     ids.append(form)
+        for li, glob in self._complex:
+            name = self._layers[li].get("name", "")
+            if not name or name in ids:
+                continue
+            if self._known is None:
+                inside = _in_glob(glob, mod)
+            else:
+                inside = _glob_hits_module(glob, mod, self._known)
+            if inside:
+                ids.append(name)
         self._cache[mod] = ids
         return ids
+
+
+def _import_identities(mod: str, layers: list[dict]) -> list[str]:
+    """IdentityIndex(layers).of(mod), for one module."""
+    return IdentityIndex(layers).of(mod)
 
 
 def _from_hit(rule: rules_mod.Rule, rel: str, layer: str) -> bool:
@@ -241,37 +351,99 @@ def _from_hit(rule: rules_mod.Rule, rel: str, layer: str) -> bool:
     return rules_mod.match_pat(rule.from_pat, mod_prefix)
 
 
+#: Below this many files a process pool costs more than it saves.
+PARALLEL_MIN_FILES = 1500
+_WORKER: dict = {}
+
+
+def _init_worker(root: str, strict_py_only: bool, go_module: str,
+                 need_content: bool) -> None:
+    _WORKER.update(root=root, strict=strict_py_only, go=go_module,
+                   content=need_content,
+                   resolver=resolve_mod.Resolver(root))
+
+
+def _scan_file(path: str) -> tuple:
+    """Read and parse one file -> (rel, imports, engine, content, warnings,
+    read error, config warnings it caused). Runs in a worker process (and
+    in this one when serial): it returns plain data, so the answer does not
+    depend on where it ran."""
+    root = _WORKER["root"]
+    resolver = _WORKER["resolver"]
+    before = len(resolver.warnings)
+    rel = _rel(root, path)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return rel, [], "none", "", [], e.strerror or type(e).__name__, []
+    sink = diag_mod.Diagnostics(echo=False)
+    imports, engine = scanner_mod.extract_imports(
+        rel, data, strict_py_only=_WORKER["strict"], diag=sink,
+        go_module=_WORKER["go"], resolver=resolver)
+    content = scanner_mod.decode_source(rel, data) if _WORKER["content"] else ""
+    return (rel, imports, engine, content, sink.warnings, "",
+            resolver.warnings[before:])
+
+
+def _scan_all(paths: list, root: str, strict_py_only: bool, go_module: str,
+              need_content: bool, jobs: int) -> list:
+    """The _scan_file() result of every path, in path order."""
+    args = (root, strict_py_only, go_module, need_content)
+    if jobs > 1 and len(paths) >= PARALLEL_MIN_FILES:
+        try:
+            import concurrent.futures as futures
+            with futures.ProcessPoolExecutor(
+                    max_workers=jobs, initializer=_init_worker,
+                    initargs=args) as pool:
+                chunk = max(16, len(paths) // (jobs * 8))
+                return list(pool.map(_scan_file, paths, chunksize=chunk))
+        except (OSError, ImportError, futures.process.BrokenProcessPool):
+            pass                      # no pool here: do it in this process
+    _init_worker(*args)
+    return [_scan_file(p) for p in paths]
+
+
+def default_jobs() -> int:
+    return max(1, min(os.cpu_count() or 1, 8))
+
+
 def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
           strict_py_only: bool = False,
-          diag: "diag_mod.Diagnostics | None" = None) -> list[Violation]:
+          diag: "diag_mod.Diagnostics | None" = None,
+          jobs: int = 0) -> list[Violation]:
     """Scan `root` and evaluate every rule.
 
     Warnings (a rule or layer that covers no file, ...) go to `diag`, which
     prints them on stderr; the caller decides whether they fail the run.
+    `jobs` is the number of worker processes (0: one per CPU, up to 8);
+    the answer is the same for any value.
     """
     diag = diag if diag is not None else diag_mod.Diagnostics()
     entries: list[tuple[str, str, list[tuple[str, int]], str]] = []
     go_module = langs.go_module_path(root)
+    need_content = any(r.kind in ("forbid-pattern", "require-pattern")
+                       for r in all_rules)
     seen: dict[str, list[int]] = {}   # language -> [files, files with imports]
-    for path in scanner_mod.iter_source_files(root):
-        rel = _rel(root, path)
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError as e:
+    results = _scan_all(
+        scanner_mod.iter_source_files(root), root, strict_py_only, go_module,
+        need_content, jobs if jobs > 0 else default_jobs())
+    config_warnings: list = []        # each worker reads the same configs
+    for rel, imports, engine, content, warnings, error, cfg in results:
+        config_warnings.extend(w for w in cfg if w not in config_warnings)
+        if error:
             # A file that cannot be read is not checked: never silently.
-            diag.warn(f"{rel}: cannot read ({e.strerror or type(e).__name__})"
-                      "; not checked")
+            diag.warn(f"{rel}: cannot read ({error}); not checked")
             continue
-        imports, engine = scanner_mod.extract_imports(
-            rel, data, strict_py_only=strict_py_only, diag=diag,
-            go_module=go_module)
+        for w in warnings:
+            diag.warn(w)
         if engine == "regex":
             counts = seen.setdefault(langs.language_of(rel) or "js", [0, 0])
             counts[0] += 1
             counts[1] += bool(imports)
-        content = scanner_mod.decode_source(rel, data)
         entries.append((rel, _file_layer(layers, rel), imports, content))
+    for message in config_warnings:
+        diag.warn(message)
     for message in coverage_warnings(entries, layers, all_rules):
         diag.warn(message)
     for message in no_import_warnings(seen, all_rules):
@@ -370,6 +542,24 @@ def coverage_warnings(entries: list, layers: list[dict],
                 out.append(f"{where}: rule '{rule.describe()}': target "
                            f"'{rule.to_pat}' is not a layer or a path in "
                            f"this repo{hint}")
+        elif rule.kind in ("layer-order", "only-import", "public-api"):
+            known = {l.get("name", "") for l in layers}
+            wanted = (rule.names if rule.kind == "layer-order"
+                      else [rule.from_pat])
+            missing = [n for n in wanted if "*" not in n and n not in known]
+            if missing:
+                out.append(f"{where}: {', '.join(repr(m) for m in missing)}"
+                           f" {'is' if len(missing) == 1 else 'are'} not "
+                           f"{'a layer' if len(missing) == 1 else 'layers'}"
+                           f" in {config_mod.ARCH_FILE}, so rule "
+                           f"'{rule.describe()}' enforces nothing"
+                           + rules_mod.did_you_mean(missing[0], sorted(known)))
+            elif rule.kind != "layer-order" and not any(
+                    layer and rules_mod.match_pat(rule.from_pat, layer)
+                    for _r, layer, _i, _c in entries):
+                out.append(f"{where}: no scanned source file is in layer "
+                           f"'{rule.from_pat}', so rule '{rule.describe()}' "
+                           "enforces nothing")
         elif rule.kind == "forbid-cycles":
             hit = [l["name"] for l in layers
                    if rules_mod.match_pat(rule.from_pat, l.get("name", ""))]
@@ -388,18 +578,29 @@ def coverage_warnings(entries: list, layers: list[dict],
 
 def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
              layers: list[dict],
-             all_rules: list[rules_mod.Rule]) -> list[Violation]:
+             all_rules: list[rules_mod.Rule],
+             repo_paths=None) -> list[Violation]:
     """Evaluate rules against pre-scanned entries.
 
     Each entry: (rel_path, layer, imports[(module, line)], content).
     Lets `drift` check historical git content through the same engine.
+    `repo_paths` is every file of the repository when `entries` are only
+    some of them (drift); it is used to tell an import of the repo from an
+    import of a library for layer globs such as "**/db/**".
     """
     violations: list[Violation] = []
-    index = IdentityIndex(layers)
+    needs_files = any(_complex_globs(l) for l in layers)
+    index = IdentityIndex(
+        layers, known_suffixes(repo_paths if repo_paths is not None
+                       else (e[0] for e in entries))
+        if needs_files else None)
     for rule in all_rules:
         if rule.kind == "forbid-cycles":
             violations.extend(_cycle_violations(rule, entries, layers,
                                                 index))
+        elif rule.kind in ("layer-order", "only-import", "public-api"):
+            violations.extend(_layer_rule_violations(rule, entries, layers,
+                                                     index))
         elif rule.kind == "forbid-import":
             for rel, layer, imports, _content in entries:
                 if not _from_hit(rule, rel, layer):
@@ -434,6 +635,69 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                             detail=f"missing /{rule.regex}/"))
     violations.sort(key=lambda v: (v.file, v.line))
     return violations
+
+
+# -- layer-order, only-import, public-api ----------------------------------
+
+def _layer_rule_violations(rule: rules_mod.Rule, entries: list,
+                           layers: list[dict], index: "IdentityIndex"
+                           ) -> "list[Violation]":
+    """The three rules that judge each import by the layer it lands in."""
+    names = {l.get("name", "") for l in layers if l.get("name")}
+    rank = {n: i for i, n in enumerate(rule.names)}
+    out: list[Violation] = []
+    for rel, layer, imports, _content in entries:
+        if rule.kind == "layer-order" and layer not in rank:
+            continue
+        if rule.kind == "only-import" and not _from_hit(rule, rel, layer):
+            continue
+        if rule.kind == "public-api" and rules_mod.match_pat(
+                rule.from_pat, layer):
+            continue                      # inside the layer: anything goes
+        by_line: dict = {}
+        for mod, lineno in imports:
+            by_line.setdefault(lineno, []).append(mod)
+        for lineno in sorted(by_line):
+            bad: "list[tuple[str, str]]" = []     # (module, why)
+            good: "list[str]" = []
+            for mod in by_line[lineno]:
+                idents = index.of(mod)
+                into = [i for i in idents if i in names]
+                if rule.kind == "layer-order":
+                    above = [i for i in into if i in rank
+                             and rank[i] < rank[layer]]
+                    if above:
+                        bad.append((mod, f"layer '{above[0]}' is above "
+                                         f"'{layer}'"))
+                elif rule.kind == "only-import":
+                    if not into or layer in into:
+                        continue
+                    if any(rules_mod.match_pat(a, i) for a in rule.names
+                           for i in idents):
+                        continue
+                    bad.append((mod, f"layer '{into[0]}' is not one of "
+                                     f"{', '.join(rule.names)}"))
+                else:                                   # public-api
+                    hits = [i for i in into
+                            if rules_mod.match_pat(rule.from_pat, i)]
+                    if not hits:
+                        continue
+                    if any(rules_mod.match_pat(a, i) for a in rule.names
+                           for i in idents):
+                        good.append(mod)
+                    else:
+                        bad.append((mod, f"not through "
+                                         f"{', '.join(rule.names)}"))
+            # `from db import api` yields "db" and "db.api": the line is
+            # fine when a longer import on it is allowed; the report names
+            # the most specific module that is not.
+            bad = [b for b in bad
+                   if not any(g.startswith(b[0] + ".") for g in good)]
+            if bad:
+                mod, why = max(bad, key=lambda b: (len(b[0]), b[0]))
+                out.append(Violation(rule=rule, file=rel, line=lineno,
+                                     detail=f"imports {mod} ({why})"))
+    return out
 
 
 # -- forbid-cycles --------------------------------------------------------------

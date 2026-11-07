@@ -5,3 +5,4 @@ include action.yml action.sh .pre-commit-hooks.yaml
 recursive-include tests *.py
 recursive-include tests/fixtures *
 global-exclude __pycache__ *.py[cod]
+recursive-include benchmarks *.py *.md

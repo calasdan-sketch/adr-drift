@@ -16,7 +16,6 @@ Regressions for the panel findings:
 import json
 import os
 import pathlib
-import subprocess
 import tempfile
 import unittest
 from unittest import mock

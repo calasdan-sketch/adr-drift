@@ -8,6 +8,7 @@ such as `path:` for `paths:`) are errors with a did-you-mean.
 
 from __future__ import annotations
 
+import datetime
 import dataclasses
 import os
 import posixpath
@@ -36,8 +37,9 @@ _H2_RE = re.compile(r"^##\s")
 # long run of blanks that is tried at every position, which is quadratic.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
-ARCH_KEYS = ("layers", "rules")
+ARCH_KEYS = ("layers", "rules", "waivers")
 LAYER_KEYS = ("name", "paths")
+WAIVER_KEYS = ("rule", "paths", "owner", "expires", "reason")
 #: A key with this prefix is a note, at the top level and in a layer.
 NOTE_KEY_PREFIX = "x-"
 
@@ -51,6 +53,17 @@ class ConfigError(ValueError):
 
 
 @dataclasses.dataclass
+class Waiver:
+    """A time-boxed exception to one rule (arch.yaml `waivers:`)."""
+    rule: str                # the rule's description, as reports print it
+    owner: str               # who answers for it
+    expires: datetime.date   # the last day it applies
+    reason: str
+    paths: list              # globs; empty: every file
+    line: int = 0
+
+
+@dataclasses.dataclass
 class Loaded:
     layers: list
     rules: list
@@ -59,6 +72,7 @@ class Loaded:
     #: ADRs whose status retires them (superseded, deprecated, rejected):
     #: (display path, status, number of rules NOT enforced).
     inactive: list = dataclasses.field(default_factory=list)
+    waivers: list = dataclasses.field(default_factory=list)
 
 
 #: The first word of a status that retires an ADR: its constraints are not
@@ -199,9 +213,11 @@ def _rule_item_lines(lines) -> "list[int]":
     return out
 
 
-def load_arch_yaml(root: str, problems: "list[str] | None" = None
+def load_arch_yaml(root: str, problems: "list[str] | None" = None,
+                   waivers_out: "list | None" = None
                    ) -> "tuple[list[dict], list[rules_mod.Rule]]":
-    """Returns (layers, rules). Missing arch.yaml -> ([], []).
+    """Returns (layers, rules). Missing arch.yaml -> ([], []). The waivers
+    section is appended to `waivers_out` when it is given.
 
     Raises ConfigError listing every problem, unless `problems` is given:
     then problems are appended to it and whatever did parse is returned.
@@ -242,6 +258,12 @@ def load_arch_yaml(root: str, problems: "list[str] | None" = None
             f"'{NOTE_KEY_PREFIX}' to keep it)")
     layers = _load_layers(data.get("layers"), lines, problems)
     out = _load_rules(data.get("rules"), lines, problems)
+    waivers = _load_waivers(data.get("waivers"), lines, problems)
+    if waivers_out is not None:
+        waivers_out.extend(waivers)
+    elif waivers:
+        problems.append(f"{ARCH_FILE}: waivers are present but this caller "
+                        "does not apply them")
     if own and problems:
         raise ConfigError(problems)
     return layers, out
@@ -290,6 +312,90 @@ def _load_layers(raw, lines, problems) -> "list[dict]":
     return layers
 
 
+def _item_lines(lines, key: str) -> "list[int]":
+    """Line numbers of the items of the top-level list `key:` (best effort)."""
+    start = _find_line(lines, r"^" + re.escape(key) + r"\s*:")
+    if not start:
+        return []
+    out: "list[int]" = []
+    item_indent = None
+    for i in range(start, len(lines)):
+        raw = lines[i].rstrip()
+        stripped = raw.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(stripped)
+        if indent == 0 and not stripped.startswith("-"):
+            break
+        if stripped.startswith("-") and (
+                item_indent is None or indent == item_indent):
+            item_indent = indent
+            out.append(i + 1)
+    return out
+
+
+def _load_waivers(raw, lines, problems) -> "list[Waiver]":
+    """arch.yaml `waivers:`. A waiver with no owner or no end date is the
+    thing it exists to prevent, so each of `rule`, `owner`, `expires` and
+    `reason` is required, and `expires` must be a real YYYY-MM-DD date."""
+    if raw is None:
+        return []
+    key_line = _find_line(lines, r"^waivers\s*:")
+    if not isinstance(raw, list):
+        problems.append(f"{_where(ARCH_FILE, key_line)}: 'waivers' must be a "
+                        f"list of mappings, got {type(raw).__name__}")
+        return []
+    item_lines = _item_lines(lines, "waivers")
+    out: "list[Waiver]" = []
+    for i, item in enumerate(raw):
+        line = item_lines[i] if i < len(item_lines) else key_line
+        where = _where(ARCH_FILE, line)
+        if not isinstance(item, dict):
+            problems.append(f"{where}: a waiver is a mapping with "
+                            f"{', '.join(WAIVER_KEYS)}, got {item!r}")
+            continue
+        bad = False
+        for key in item:
+            if key not in WAIVER_KEYS and not str(key).startswith(
+                    NOTE_KEY_PREFIX):
+                problems.append(
+                    f"{where}: waiver: unknown key {key!r}"
+                    f"{rules_mod.did_you_mean(key, WAIVER_KEYS)} (allowed: "
+                    f"{', '.join(WAIVER_KEYS)})")
+                bad = True
+        for key in ("rule", "owner", "expires", "reason"):
+            value = item.get(key)
+            if value is None or not str(value).strip():
+                problems.append(f"{where}: waiver has no '{key}' (a waiver "
+                                "needs a rule, an owner, an expiry date and "
+                                "a reason)")
+                bad = True
+        expires = None
+        if item.get("expires") is not None:
+            try:
+                expires = datetime.date.fromisoformat(
+                    str(item["expires"]).strip())
+            except ValueError:
+                problems.append(f"{where}: waiver 'expires' must be a date "
+                                f"like 2027-03-31, got {item['expires']!r}")
+                bad = True
+        paths = item.get("paths", [])
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list) or not all(
+                isinstance(p, str) and p for p in paths):
+            problems.append(f"{where}: waiver 'paths' must be a list of "
+                            "globs")
+            bad = True
+        if bad:
+            continue
+        out.append(Waiver(rule=" ".join(str(item["rule"]).split()),
+                          owner=str(item["owner"]).strip(), expires=expires,
+                          reason=str(item["reason"]).strip(),
+                          paths=list(paths), line=line))
+    return out
+
+
 def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
     if raw is None:
         return []
@@ -332,8 +438,11 @@ def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
                 + (f" - {hint}" if hint else
                    " (rules are 'forbid-import: <from> -> <to>', "
                    "'forbid-pattern: <glob> !~ <regex>', "
-                   "'require-pattern: <glob> =~ <regex>' or "
-                   "'forbid-cycles: <layers>')"))
+                   "'require-pattern: <glob> =~ <regex>', "
+                   "'forbid-cycles: <layers>', "
+                   "'layer-order: <a> > <b> > <c>', "
+                   "'only-import: <layer> -> <a>, <b>' or "
+                   "'public-api: <layer> -> <module>')"))
             continue
         out.append(rule)
     return out
@@ -594,6 +703,94 @@ def adr_title_and_status(lines: "list[str]") -> "tuple[str, str]":
     return title, status or _status_line(body)
 
 
+_OWNER_KEYS = ("owner", "owners", "deciders", "decision-makers",
+               "decision_makers", "decider")
+_OWNER_LINE_RE = re.compile(
+    r"[ \t]*(?:[-*+][ \t]+)?(?:\*\*|__)?(owners?|deciders?|"
+    r"decision[- _]makers?)(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(.+)$",
+    re.IGNORECASE)
+_DECISION_HEADING_RE = re.compile(
+    r"##[ \t]+(?:decision(?:[ \t]+outcome)?|resolution)[ \t]*$", re.IGNORECASE)
+_BACKTICKED_RE = re.compile(r"`([^`\n]{1,200})`")
+_MAX_OWNERS = 20
+_MAX_NAME = 80
+_MAX_REFS = 500
+
+
+def _split_names(value: str) -> "list[str]":
+    value = value.strip().strip("[]")
+    names = [n.strip().strip("'\"`*_")[:_MAX_NAME]
+             for n in re.split(r"[,;]|\band\b", value[:2000])]
+    return [n for n in names if n][:_MAX_OWNERS]
+
+
+def adr_owners(lines: "list[str]") -> "list[str]":
+    """Who decided / owns an ADR: the front matter's owner(s) / deciders /
+    decision-makers, else an `Owner:` / `Deciders:` line above the first
+    `##` heading. [] when it names none."""
+    lines = _without_fences(lines)
+    front, start = _front_matter(lines)
+    for i, line in enumerate(front):
+        m = re.match(r"([A-Za-z_-]+)[ \t]*:[ \t]*(.*)$", line)
+        if not m or m.group(1).lower() not in _OWNER_KEYS:
+            continue
+        value = _yaml_scalar(m.group(2))
+        if not value:                      # a block list under the key
+            items = []
+            for nxt in front[i + 1:]:
+                bullet = re.match(r"[ \t]*-[ \t]+(.+)$", nxt)
+                if not bullet:
+                    break
+                items.append(_yaml_scalar(bullet.group(1)))
+            return [x[:_MAX_NAME] for x in items if x][:_MAX_OWNERS]
+        return _split_names(value)
+    for line in lines[start:start + _STATUS_ZONE]:
+        if _H2_RE.match(line):
+            break
+        m = _OWNER_LINE_RE.match(line)
+        if m:
+            return _split_names(m.group(2))
+    return []
+
+
+def adr_decision(lines: "list[str]", limit: int = 400) -> str:
+    """The first words of the `## Decision` (or `Decision Outcome`) section,
+    on one line; "" when there is none."""
+    lines = _without_fences(lines)
+    for i, line in enumerate(lines):
+        if _DECISION_HEADING_RE.match(line):
+            words: "list[str]" = []
+            for nxt in lines[i + 1:]:
+                if _H2_RE.match(nxt):
+                    break
+                text = re.sub(r"^[ \t]*(?:[-*+>]|\d+[.)])[ \t]+", "",
+                              nxt.strip())
+                if text:
+                    words.append(text)
+                if sum(len(w) + 1 for w in words) > limit:
+                    break
+            out = " ".join(words)
+            return out if len(out) <= limit else out[:limit - 1].rstrip() + "\u2026"
+    return ""
+
+
+def adr_code_refs(lines: "list[str]") -> "list[tuple[str, int]]":
+    """(path, line) of each `backticked/path` an ADR mentions that looks
+    like a file or directory of the repository: it has a `/` and no
+    spaces, wildcards or URL scheme."""
+    out = []
+    for n, line in enumerate(_without_fences(lines), 1):
+        for m in _BACKTICKED_RE.finditer(line):
+            ref = m.group(1).strip()
+            if ("/" in ref and not re.search(r"[\s*?<>{}$|=:]", ref)
+                    and not ref.startswith(("/", "~", "..", "http"))
+                    and ".." not in ref.split("/")):
+                out.append((ref.rstrip("/"), n))
+                if len(out) >= _MAX_REFS:
+                    return out
+    return out
+
+
 def parse_adr(path: str, display: "str | None" = None,
               parse_rules: bool = True) -> dict:
     """Extract number, title, status, and constraint rules from an ADR.
@@ -628,6 +825,9 @@ def parse_adr(path: str, display: "str | None" = None,
                if retire[0] != retire[1] else ""))
     info["title"] = title or info["title"]
     info["status"] = status
+    info["owners"] = adr_owners(lines)
+    info["decision"] = adr_decision(lines)
+    info["code_refs"] = adr_code_refs(lines)
     if not parse_rules:
         return info
     problems: "list[str]" = []
@@ -672,7 +872,8 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     `adr_dir` is None (look in the usual places), one directory or a list of
     them; see find_adrs()."""
     problems: "list[str]" = []
-    layers, arch_rules = load_arch_yaml(root, problems)
+    waivers: "list[Waiver]" = []
+    layers, arch_rules = load_arch_yaml(root, problems, waivers)
     adrs: "list[dict]" = []
     search = find_adrs(root, adr_dir)
     warnings: "list[str]" = list(search.warnings)
@@ -705,7 +906,17 @@ def load_all(root: str, adr_dir=None) -> Loaded:
                 os.sep, "/"), a["status"], len(a["rules"])))
             continue
         all_rules.extend(a["rules"])
-    return Loaded(layers, all_rules, adrs, warnings, inactive)
+    known = {r.describe() for r in all_rules}
+    for w in waivers:
+        if w.rule not in known:
+            near = rules_mod.did_you_mean(w.rule, sorted(known))
+            problems.append(
+                f"{_where(ARCH_FILE, w.line)}: waiver names the rule "
+                f"{w.rule!r}, which no enforced rule says{near}; write it "
+                "exactly as `adr-drift check` prints it")
+    if problems:
+        raise ConfigError(problems)
+    return Loaded(layers, all_rules, adrs, warnings, inactive, waivers)
 
 
 def load_all_rules(root: str, adr_dir=None

@@ -265,12 +265,18 @@ def _js_clause_end(t: _Tokens, j: int) -> int:
     return -1
 
 
-def _js(path: str, t: _Tokens) -> "list[tuple[str, int]]":
+def _js(path: str, t: _Tokens, resolve=None) -> "list[tuple[str, int]]":
+    """`resolve(path, spec)` (resolve.Resolver.js) maps a non-relative
+    specifier - a tsconfig alias, a baseUrl path, a workspace package - to
+    the module(s) it stands for; the specifier itself is kept as well."""
     found = []
 
     def add(spec: str, i: int) -> None:
         if spec.startswith(("./", "../")):
             spec = _resolve_relative(path, spec)
+        elif resolve is not None:
+            for extra in resolve(path, spec):
+                found.append((extra, t.line[i]))
         found.append((spec, t.line[i]))
 
     for i in range(t.n):
@@ -564,14 +570,16 @@ _EXTRACTORS = {"js": _js, "go": _go, "java": _java, "rust": _rust,
                "php": _php, "ruby": _ruby}
 
 
-def extract(path: str, text: str, lang: "str | None" = None
-            ) -> "list[tuple[str, int]]":
+def extract(path: str, text: str, lang: "str | None" = None,
+            resolve_js=None) -> "list[tuple[str, int]]":
     """(module, line) for every import of a non-Python source file, in line
     order. `lang` defaults to the language of `path` (JavaScript/TypeScript
     when the extension is unknown)."""
     lang = lang or language_of(path) or "js"
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    found = _EXTRACTORS[lang](path, _Tokens(text, lang))
+    tokens = _Tokens(text, lang)
+    found = (_js(path, tokens, resolve_js) if lang == "js"
+             else _EXTRACTORS[lang](path, tokens))
     return sorted(set(found), key=lambda item: (item[1], item[0]))
 
 

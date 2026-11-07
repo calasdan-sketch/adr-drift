@@ -241,3 +241,104 @@ def sarif_text(violations, version: str, identity, prefix: str = "",
                retired=()) -> str:
     return json.dumps(sarif_log(violations, version, identity, prefix,
                                 retired), indent=2)
+
+
+# -- Markdown (a pull-request comment) -----------------------------------------
+
+#: GitHub refuses a comment over 65536 characters.
+MARKDOWN_LIMIT = 60000
+_ROWS_PER_RULE = 25
+
+
+def _md(text: str) -> str:
+    """`text` from the repository as inert Markdown: it cannot start a link,
+    an HTML tag, a heading, a table cell or an @-mention (a mention in a
+    comment notifies the person, and ADR text is written by the pull
+    request's author)."""
+    text = " ".join(str(text).split())
+    out = []
+    for ch in text:
+        if _is_unsafe(ch):
+            out.append(_escape_char(ch))
+        elif ch == "@":
+            out.append("&#64;")
+        elif ch in "<>&":
+            out.append({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[ch])
+        elif ch in "\\`*_[]()|#!~":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _code(text: str) -> str:
+    """`text` in a code span (an @-name inside one does not notify)."""
+    text = " ".join(str(text).split())
+    text = "".join(_escape_char(c) if _is_unsafe(c) else c for c in text)
+    text = text.replace("|", "\\|")
+    run = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * (run + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def markdown_report(violations, adrs_by_source: dict, owners_of,
+                    prefix: str = "", title: str = "adr-drift",
+                    note: str = "", retired=()) -> str:
+    """A pull-request comment: for every rule that was broken, the ADR it
+    comes from (title, status, who decided it, the decision in a sentence)
+    and the offending lines with the people who own those files.
+
+    `adrs_by_source` maps a rule's source ("docs/adr/0001-x.md") to the ADR
+    dict from config.parse_adr; `owners_of(path)` returns CODEOWNERS owners.
+    Output is capped at MARKDOWN_LIMIT characters."""
+    n = len(violations)
+    if not n:
+        body = [f"### {_md(title)}: no architecture drift", ""]
+        if note:
+            body += [_md(note), ""]
+        return "\n".join(body).rstrip() + "\n"
+    by_rule: dict = {}
+    for v in violations:
+        by_rule.setdefault((v.rule.describe(), v.rule.source), []).append(v)
+    out = [f"### {_md(title)}: {n} architecture violation"
+           f"{'' if n == 1 else 's'}", ""]
+    for (text, source), items in sorted(by_rule.items()):
+        out.append(f"**{_md(text)}**")
+        adr = adrs_by_source.get(source)
+        if adr:
+            label = f"ADR {adr['number'] or ''} {adr['title']}".replace(
+                "ADR  ", "ADR ").strip()
+            bits = [f"{_md(label)} ({_code(source)})"]
+            if adr["status"]:
+                bits.append(f"status: {_md(adr['status'])}")
+            if adr.get("owners"):
+                bits.append("decided by "
+                            + ", ".join(_code(o) for o in adr["owners"]))
+            out.append("- " + " · ".join(bits))
+            if adr.get("decision"):
+                out.append(f"- > {_md(adr['decision'])}")
+        else:
+            out.append(f"- from {_code(source)}")
+        out += ["", "| File | Line | Found | Owners |", "|---|---|---|---|"]
+        for v in items[:_ROWS_PER_RULE]:
+            owners = ", ".join(_code(o) for o in owners_of(v.file)) or "-"
+            where = _join(prefix, v.file)
+            out.append(f"| {_code(where)} | {v.line or '-'} | "
+                       f"{_md(v.detail)} | {owners} |")
+            for step in v.evidence:
+                out.append(f"|  |  | {_md(step)} |  |")
+        if len(items) > _ROWS_PER_RULE:
+            out.append(f"| ... | | and {len(items) - _ROWS_PER_RULE} more | |")
+        out.append("")
+    if note:
+        out += [_md(note), ""]
+    for path, status, count in retired:
+        if count:
+            out.append(f"_{_md(retired_message(path, status, count))}_")
+    text = "\n".join(out).rstrip() + "\n"
+    if len(text) > MARKDOWN_LIMIT:
+        text = (text[:MARKDOWN_LIMIT].rsplit("\n", 1)[0]
+                + "\n\n_(report cut to fit a GitHub comment; run "
+                "`adr-drift check` for all of it)_\n")
+    return text

@@ -7,6 +7,12 @@ A rule is one line:
     require-pattern: <glob> =~ <regex>   # files matching <glob> must contain <regex>
     forbid-cycles: <layers>              # the layers matching <layers> must not
                                          # depend on each other in a loop
+    layer-order: a > b > c               # a layer may import only layers to its
+                                         # right (never the ones above it)
+    only-import: <from> -> x, y          # <from> may import, of this repo's
+                                         # layers, only x and y (and itself)
+    public-api: <layer> -> m1, m2        # from outside <layer>, only the
+                                         # modules m1, m2 may be imported
 
 <from>/<to> match against layer names or module prefixes ("db.drivers",
 "src/handlers"). "*" is a wildcard. Comments start with "#".
@@ -21,7 +27,7 @@ import re
 
 #: The rule names the DSL knows.
 KINDS = ("forbid-import", "forbid-pattern", "require-pattern",
-         "forbid-cycles")
+         "forbid-cycles", "layer-order", "only-import", "public-api")
 
 
 @dataclasses.dataclass
@@ -37,6 +43,9 @@ class Rule:
     # pattern rules
     glob: str = ""
     regex: str = ""
+    # layer-order: the layers, highest first. only-import / public-api: the
+    # allowed targets.
+    names: list = dataclasses.field(default_factory=list)
 
     def describe(self) -> str:
         if self.kind == "forbid-import":
@@ -45,6 +54,14 @@ class Rule:
             return f"{self.glob} must not contain /{self.regex}/"
         if self.kind == "forbid-cycles":
             return f"layers {self.from_pat} must not depend on each other in a cycle"
+        if self.kind == "layer-order":
+            return "layers " + " > ".join(self.names) + " may only import downward"
+        if self.kind == "only-import":
+            return (f"{self.from_pat} may only import "
+                    f"{', '.join(self.names)} of this repo's layers")
+        if self.kind == "public-api":
+            return (f"{self.from_pat} may only be imported through "
+                    f"{', '.join(self.names)}")
         return f"{self.glob} must contain /{self.regex}/"
 
     def where(self) -> str:
@@ -55,7 +72,8 @@ class Rule:
 # The text is stripped before it is matched, so no \s*$ is needed after the
 # rest (a lazy group followed by \s*$ is quadratic on a long run of blanks).
 _RULE_RE = re.compile(
-    r"^(forbid-import|forbid-pattern|require-pattern|forbid-cycles)\s*:\s*(.+)$")
+    r"^(forbid-import|forbid-pattern|require-pattern|forbid-cycles|"
+    r"layer-order|only-import|public-api)\s*:\s*(.+)$")
 
 
 def parse_rule_line(line: str, source: str = "",
@@ -87,6 +105,31 @@ def parse_rule_line(line: str, source: str = "",
                     f"bad forbid-import rule: {line.strip()!r} ({side!r} "
                     "contains spaces; each side is one layer name or module "
                     "prefix - put explanations after a '#')")
+    elif kind == "layer-order":
+        names = [n.strip() for n in rest.split(">")]
+        if (len(names) < 2 or any(not n or re.search(r"[\s,*]", n)
+                                  for n in names)
+                or len(set(names)) != len(names)):
+            raise ValueError(
+                f"bad layer-order rule: {line.strip()!r} (want two or more "
+                "different layer names, highest first, like 'layer-order: "
+                "handlers > services > db' - put explanations after a '#')")
+        rule.names = names
+        rule.from_pat = names[0]
+    elif kind in ("only-import", "public-api"):
+        parts = rest.split("->")
+        targets = ([t.strip() for t in parts[1].split(",")]
+                   if len(parts) == 2 else [])
+        if (len(parts) != 2 or not parts[0].strip() or not targets
+                or any(not t or re.search(r"\s", t) for t in targets)
+                or re.search(r"\s", parts[0].strip())):
+            raise ValueError(
+                f"bad {kind} rule: {line.strip()!r} (want '<layer> -> "
+                "<name>[, <name>...]', names without spaces - put "
+                "explanations after a '#')")
+        rule.from_pat = parts[0].strip()
+        rule.names = targets
+        rule.to_pat = ", ".join(targets)
     elif kind == "forbid-cycles":
         pat = rest.strip()
         if re.search(r"\s", pat):
@@ -119,10 +162,12 @@ _TASK_RE = re.compile(r"^\[[ xX]\]\s+")
 _EMPHASIS_RE = re.compile(r"^(\*\*|__)(.*?)\1")
 _HEAD_WORD_RE = re.compile(r"^([A-Za-z][A-Za-z_ -]{2,40}?)\s*:")
 _KEYWORD_INSIDE_RE = re.compile(
-    r"(?<![\w-])(?:forbid|require)[-_ ]?(?:import|pattern|cycle)s?\s*:", re.I)
+    r"(?<![\w-])(?:(?:forbid|require)[-_ ]?(?:import|pattern|cycle)s?"
+    r"|layer[-_ ]order|only[-_ ]import|public[-_ ]api)\s*:", re.I)
 _BARE_ARROW_RE = re.compile(r"^[\w.*/-]+\s*->\s*[\w.*/-]+$")
 _NAME_NO_COLON_RE = re.compile(
-    r"^(?:forbid-import|forbid-pattern|require-pattern|forbid-cycles)\s")
+    r"^(?:forbid-import|forbid-pattern|require-pattern|forbid-cycles|"
+    r"layer-order|only-import|public-api)\s")
 
 
 def clean_rule_text(line: str) -> "tuple[str, bool]":
@@ -184,7 +229,7 @@ def rule_like_problem(text: str, listed: bool = False) -> "str | None":
                 f"'{t.split(None, 1)[0]}: ...'")
     m = _KEYWORD_INSIDE_RE.search(t)
     if m:
-        operators = ("->", "!~", "=~")
+        operators = ("->", "!~", "=~", ">")
         # A list item, or a line that carries a rule's payload after the
         # name, is a rule attempt; a sentence that merely names the keyword
         # is prose.
