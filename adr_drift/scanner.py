@@ -214,14 +214,46 @@ def extract_imports(path: str, source=None, strict_py_only: bool = False,
     return [], "none"
 
 
-def iter_source_files(root: str) -> list[str]:
+DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024
+
+
+def max_file_bytes() -> int:
+    """Largest source file read, in bytes (ADR_DRIFT_MAX_FILE_BYTES; 0 = no
+    limit). A generated or minified file of hundreds of megabytes would
+    otherwise be read whole into memory (an 80 MB file ran a small CI
+    runner out of memory)."""
+    try:
+        return max(0, int(os.environ.get("ADR_DRIFT_MAX_FILE_BYTES",
+                                         DEFAULT_MAX_FILE_BYTES)))
+    except ValueError:
+        return DEFAULT_MAX_FILE_BYTES
+
+
+def _inside(root_real: str, path: str) -> bool:
+    real = os.path.realpath(path)
+    return real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep)
+
+
+def iter_source_files(root: str, skipped: "list | None" = None) -> list[str]:
+    """Source files under `root`. A symbolic link whose target is outside
+    `root` is not read (a pull request could otherwise make a pattern rule
+    read, and so probe, any file of the CI machine); it is added to
+    `skipped` as (path, reason) so the caller can warn."""
     skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv",
                  "dist", "build", ".tox", "vendor"}
     out: list[str] = []
+    root_real = os.path.realpath(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for fn in filenames:
             ext = os.path.splitext(fn)[1].lower()
             if ext in PY_EXTS or ext in GENERIC_EXTS:
-                out.append(os.path.join(dirpath, fn))
+                full = os.path.join(dirpath, fn)
+                if os.path.islink(full) and not _inside(root_real, full):
+                    if skipped is not None:
+                        skipped.append((os.path.relpath(full, root).replace(
+                            os.sep, "/"),
+                            "symbolic link to a file outside the repository"))
+                    continue
+                out.append(full)
     return sorted(out)

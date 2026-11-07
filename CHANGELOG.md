@@ -8,6 +8,34 @@ monorepo engineer, a CI lead, a governance lead and a skeptical tech lead)
 found missing. Benchmark on a generated seven-language corpus
 (`benchmarks/`): recall 63.2% -> 100%, precision 85.8% -> 100%.
 
+### Expert round 3 (still 0.3.0, unreleased)
+
+Panel: an attacker (a pull request that carries hostile rules and files), a
+CI/platform engineer, an end user adopting from the README alone, a
+governance auditor, a performance engineer and a competitor's engineer
+(import-linter / Tach). Round 2's known gaps (no picture of the layers, no
+way to start from the code) were built too.
+
+Fixed
+- A pattern rule with a catastrophic regex (`(a+)+$`) hung CI for ever; a
+  rule may now spend 20 s (`ADR_DRIFT_REGEX_SECONDS`) and then fails the run
+  with exit 2 naming the rule. POSIX only; off on Windows.
+- A regex nested thousands of groups deep crashed with a traceback and exit 1
+  (which reads as "violations found"); it is now a configuration error.
+- A symbolic link to a file outside the repository was read, so a pattern
+  rule could probe any file of the machine; it is skipped with a warning.
+- A huge source file (80 MB) ran a small runner out of memory; files over
+  4 MiB (`ADR_DRIFT_MAX_FILE_BYTES`) are skipped with a warning, in `check`,
+  `baseline` and `drift`.
+
+Added
+- `graph` (Mermaid, DOT, JSON), `suggest` (rules that already hold) and
+  `rules-diff --since REF [--fail-on-weakened]` (rules removed, ADRs retired,
+  layers narrowed, waivers added or extended), see the README.
+- `engine.scan_entries` (the scan half of `engine.check`),
+  `scanner.iter_source_files(root, skipped)` and `scanner.max_file_bytes()`.
+- `benchmarks/hostile.py`.
+
 Added
 - Import resolution from the repository's own config (`resolve.py`):
   TypeScript/JavaScript `compilerOptions.paths` and `baseUrl` from the

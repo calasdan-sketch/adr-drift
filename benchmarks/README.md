@@ -39,6 +39,25 @@ a layer glob `ts/src/**/db/**` or `ruby/lib/**/db/**` made every module
 under `ts/src` or `ruby/lib` a member of the db layer (`ts-service` 11,
 `ruby-service` 26, `ts-lookalike` 15).
 
+## hostile.py (round 3)
+
+`python3 benchmarks/hostile.py` times three repositories a pull request could
+carry (2026-11-07, 2 CPUs, a shared machine, so read the times as rough):
+
+| case | exit | seconds |
+|---|---|---|
+| catastrophic regex `(a+)+$`, budget 2 s | 2 | 2.5 |
+| 30 MB source file | 0 (warning) | 0.2 |
+| regex nested 100 000 groups | 2 | 0.3 |
+
+The round 2 code did not finish the first case in 250 s (killed); the
+80 MB file case in round 2 was killed for memory on this machine (once, by
+hand, not part of the script). Detection numbers above are unchanged by
+round 3 (recall and precision 100%; the speed figure moved between 3.8 and
+6.5 s on 20 000 files across five runs, round 2 code 6.5 to 11.6 s on the
+same machine, because the machine's disk was busy: no speed change is
+claimed).
+
 ## compare.py
 
 `compare.py` builds one valid Python and one TypeScript project, plants one

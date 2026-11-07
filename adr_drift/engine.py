@@ -8,6 +8,8 @@ import fnmatch
 import functools
 import os
 import re
+import signal
+import threading
 
 from . import config as config_mod
 from . import diag as diag_mod
@@ -372,8 +374,14 @@ def _scan_file(path: str) -> tuple:
     resolver = _WORKER["resolver"]
     before = len(resolver.warnings)
     rel = _rel(root, path)
+    limit = scanner_mod.max_file_bytes()
     try:
         with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if limit and size > limit:
+                return (rel, [], "none", "", [],
+                        f"{size} bytes, over the {limit}-byte limit "
+                        "(ADR_DRIFT_MAX_FILE_BYTES)", [])
             data = f.read()
     except OSError as e:
         return rel, [], "none", "", [], e.strerror or type(e).__name__, []
@@ -408,25 +416,24 @@ def default_jobs() -> int:
     return max(1, min(os.cpu_count() or 1, 8))
 
 
-def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
-          strict_py_only: bool = False,
-          diag: "diag_mod.Diagnostics | None" = None,
-          jobs: int = 0) -> list[Violation]:
-    """Scan `root` and evaluate every rule.
-
-    Warnings (a rule or layer that covers no file, ...) go to `diag`, which
-    prints them on stderr; the caller decides whether they fail the run.
-    `jobs` is the number of worker processes (0: one per CPU, up to 8);
-    the answer is the same for any value.
-    """
-    diag = diag if diag is not None else diag_mod.Diagnostics()
+def scan_entries(root: str, layers: list[dict],
+                 all_rules: list[rules_mod.Rule], strict_py_only: bool,
+                 diag: "diag_mod.Diagnostics", jobs: int = 0
+                 ) -> "tuple[list, dict]":
+    """Read every source file under `root`: ([(rel, layer, imports,
+    content)], {language: [files, files with imports]}). Problems with
+    single files go to `diag` as warnings."""
     entries: list[tuple[str, str, list[tuple[str, int]], str]] = []
     go_module = langs.go_module_path(root)
     need_content = any(r.kind in ("forbid-pattern", "require-pattern")
                        for r in all_rules)
     seen: dict[str, list[int]] = {}   # language -> [files, files with imports]
+    skipped_links: list = []
+    paths = scanner_mod.iter_source_files(root, skipped_links)
+    for rel_link, why in skipped_links:
+        diag.warn(f"{rel_link}: {why}; not checked")
     results = _scan_all(
-        scanner_mod.iter_source_files(root), root, strict_py_only, go_module,
+        paths, root, strict_py_only, go_module,
         need_content, jobs if jobs > 0 else default_jobs())
     config_warnings: list = []        # each worker reads the same configs
     for rel, imports, engine, content, warnings, error, cfg in results:
@@ -444,6 +451,23 @@ def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
         entries.append((rel, _file_layer(layers, rel), imports, content))
     for message in config_warnings:
         diag.warn(message)
+    return entries, seen
+
+
+def check(root: str, layers: list[dict], all_rules: list[rules_mod.Rule],
+          strict_py_only: bool = False,
+          diag: "diag_mod.Diagnostics | None" = None,
+          jobs: int = 0) -> list[Violation]:
+    """Scan `root` and evaluate every rule.
+
+    Warnings (a rule or layer that covers no file, ...) go to `diag`, which
+    prints them on stderr; the caller decides whether they fail the run.
+    `jobs` is the number of worker processes (0: one per CPU, up to 8);
+    the answer is the same for any value.
+    """
+    diag = diag if diag is not None else diag_mod.Diagnostics()
+    entries, seen = scan_entries(root, layers, all_rules, strict_py_only,
+                                 diag, jobs)
     for message in coverage_warnings(entries, layers, all_rules):
         diag.warn(message)
     for message in no_import_warnings(seen, all_rules):
@@ -576,6 +600,52 @@ def coverage_warnings(entries: list, layers: list[dict],
     return out
 
 
+class RuleTooSlow(Exception):
+    """A pattern rule used up its time budget (catastrophic backtracking)."""
+
+
+def regex_budget() -> float:
+    """Seconds one pattern rule may spend on the whole repository
+    (ADR_DRIFT_REGEX_SECONDS, default 20; 0 turns the guard off)."""
+    try:
+        return max(0.0, float(os.environ.get("ADR_DRIFT_REGEX_SECONDS", "20")))
+    except ValueError:
+        return 20.0
+
+
+class _regex_guard:
+    """Interrupts a regex that runs too long. A rule comes from a file in the
+    repository, so a pull request can add `(a+)+$` and hang CI for ever;
+    `re` has no timeout of its own, but it does let a signal through. Needs
+    SIGALRM and the main thread (POSIX); elsewhere the guard is off and the
+    README says so."""
+
+    def __init__(self, rule) -> None:
+        self.rule = rule
+        self.armed = False
+
+    def __enter__(self):
+        seconds = regex_budget()
+        if (seconds > 0 and hasattr(signal, "setitimer")
+                and threading.current_thread() is threading.main_thread()):
+            def fire(_sig, _frame):
+                raise RuleTooSlow(
+                    f"{self.rule.describe()} ({self.rule.where()}) took "
+                    f"more than {seconds:g} s: the regex probably backtracks "
+                    "catastrophically; rewrite it (no nested repeats such as "
+                    "(a+)+) or raise ADR_DRIFT_REGEX_SECONDS")
+            self.old = signal.signal(signal.SIGALRM, fire)
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            self.armed = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self.old)
+        return False
+
+
 def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
              layers: list[dict],
              all_rules: list[rules_mod.Rule],
@@ -618,21 +688,22 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                             detail=f"imports {mod}"))
         else:
             rx = re.compile(rule.regex)
-            for rel, _layer, _imports, content in entries:
-                if not rules_mod.match_glob(rule.glob, rel):
-                    continue
-                if rule.kind == "forbid-pattern":
-                    for i, line in enumerate(
-                            scanner_mod.split_lines(content), 1):
-                        if rx.search(line):
+            with _regex_guard(rule):
+                for rel, _layer, _imports, content in entries:
+                    if not rules_mod.match_glob(rule.glob, rel):
+                        continue
+                    if rule.kind == "forbid-pattern":
+                        for i, line in enumerate(
+                                scanner_mod.split_lines(content), 1):
+                            if rx.search(line):
+                                violations.append(Violation(
+                                    rule=rule, file=rel, line=i,
+                                    detail=f"matches /{rule.regex}/"))
+                    else:  # require-pattern
+                        if not rx.search(content):
                             violations.append(Violation(
-                                rule=rule, file=rel, line=i,
-                                detail=f"matches /{rule.regex}/"))
-                else:  # require-pattern
-                    if not rx.search(content):
-                        violations.append(Violation(
-                            rule=rule, file=rel, line=0,
-                            detail=f"missing /{rule.regex}/"))
+                                rule=rule, file=rel, line=0,
+                                detail=f"missing /{rule.regex}/"))
     violations.sort(key=lambda v: (v.file, v.line))
     return violations
 

@@ -234,3 +234,25 @@ def tree_paths(root: str, ref: str = "HEAD") -> "list[str]":
     `drift` uses it to know which files a layer glob can reach."""
     out = _run(root, "ls-tree", "-r", "-z", "--name-only", ref)
     return [p.decode("utf-8", "replace") for p in out.split(b"\0") if p]
+
+
+def config_files(root: str, ref: str) -> "dict[str, bytes]":
+    """`arch.yaml` and every Markdown file of commit `ref` (the files that
+    can hold rules), as {path relative to root: content}."""
+    out = _run(root, "ls-tree", "-r", "-z", ref)
+    wanted: "dict[str, str]" = {}
+    for rec in out.split(b"\0"):
+        if not rec or b"\t" not in rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        parts = meta.split()
+        if len(parts) != 3 or parts[0] not in _REGULAR_MODES:
+            continue
+        name = path.decode("utf-8", "replace")
+        low = name.lower()
+        hidden = any(p.startswith(".") or p in ("node_modules", "vendor")
+                     for p in name.split("/")[:-1])
+        if not hidden and (low == "arch.yaml" or low.endswith(".md")):
+            wanted[name] = parts[2].decode("ascii")
+    blobs = read_blobs(root, list(wanted.values()))
+    return {n: blobs[b] for n, b in wanted.items() if blobs.get(b) is not None}

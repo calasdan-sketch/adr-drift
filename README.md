@@ -69,6 +69,7 @@ is, everything below that is newer than the released version (cycles,
 ```bash
 cd your-repo
 python3 -m adr_drift init      # scaffold arch.yaml + sample ADR from folder layout
+python3 -m adr_drift suggest   # rules that already hold in your code, to paste in
 # enable a rule in arch.yaml and/or add ## Constraints to your ADRs
 python3 -m adr_drift check     # verify; exit 1 on violations (CI-ready)
 # repo already has legacy violations? grandfather them, then enforce:
@@ -85,6 +86,9 @@ python3 -m adr_drift check --baseline .adr-baseline.json
 | `baseline` | Write current violations to `.adr-baseline.json` (default) for `check --baseline` (violations covered by a live waiver are left out) |
 | `coverage` | Which ADRs in force enforce a rule, which name paths that no longer exist, and the waivers (`--fail-under PERCENT`; exit 1 on an expired waiver) |
 | `drift --since HEAD~5` | Report violations *introduced* between a git ref and `HEAD`, plus violations *fixed* in that range (pre-existing ones ignored) |
+| `graph` | Draw how the layers import each other: Mermaid (default, pastes into a pull request or README), Graphviz DOT or JSON, with the number of imports on each edge and layer loops in red |
+| `suggest` | Print rules that already hold in the code today (`forbid-cycles: *`, a `layer-order` in the order the code follows) for you to review and paste; prints nothing it cannot back, and a note when the layers already loop. Never writes a file |
+| `rules-diff --since REF` | How the *rules* changed between `REF` (default `HEAD~1`) and `HEAD`, from the committed files: rules removed or added, ADRs retired, layers that lost paths, waivers added or extended. `--fail-on-weakened` exits 1 if anything weakened |
 | `new "title"` | Create the next-numbered ADR from a template |
 | `index` | Regenerate the ADR index (`docs/adr/README.md`); a `README.md` adr-drift did not write is left alone unless you pass `--force` |
 
@@ -311,6 +315,41 @@ and every problem in every file is listed in one run:
 - A repo with no rules at all fails (exit 2) unless you pass `--allow-empty`:
   a green check that enforces nothing is worse than a red one.
 
+### Rules can be weakened too: `rules-diff`
+
+`check` and `drift` judge the code. A pull request can also pass them by
+changing the rules: delete one, mark its ADR `Superseded`, give a layer
+narrower `paths`, add a waiver. `adr-drift rules-diff --since
+"$(git merge-base origin/main HEAD)"` lists exactly those moves (it reads
+`arch.yaml` and the Markdown files of the two commits out of git, not your
+working tree); put it in the pull-request job next to `check`, with
+`--fail-on-weakened` if a weakening should need a human to re-run the job.
+It does not say whether a change is wrong, only that it is there. A rule
+written in two places (arch.yaml and an ADR) is compared by its text, so
+removing one of the two copies is not shown.
+
+### Hostile repositories
+
+The rules and the code both come from the pull request being checked, so
+adr-drift treats them as untrusted:
+
+- A pattern rule that runs longer than 20 s on the whole repository (a regex
+  such as `(a+)+$` backtracks without end) stops the run with exit 2 and
+  names the rule; `ADR_DRIFT_REGEX_SECONDS` changes the budget (0 = off).
+  Python's `re` has no timeout of its own, so this uses a timer signal: it
+  works on Linux and macOS in the main thread and **is off on Windows**,
+  where such a rule still hangs.
+- A regex that Python cannot compile (nested thousands of groups deep) is a
+  configuration error, not a traceback.
+- A source file larger than 4 MiB (`ADR_DRIFT_MAX_FILE_BYTES`, 0 = off) is
+  not read, in `check`, `baseline` and `drift`: a warning, exit 2 under
+  `--strict`. An 80 MB generated file used to be read whole.
+- A symbolic link to a file outside the repository is not read, so a rule
+  cannot be used to probe files of the CI machine; a warning says so. Links
+  that stay inside the repository are read.
+
+`python3 benchmarks/hostile.py` times these cases.
+
 ## How it checks
 
 - **Python** is parsed with the real `ast` — no regex false positives from
@@ -535,6 +574,10 @@ code uses, not a sample of real repositories.
 | adr-drift 0.2.0 (before this round) | 63.2% (314 / 497) | 85.8% (52 false alarms) | 1.9 s, 53 MB (one process) |
 | adr-drift 0.3.0 | 100% (497 / 497) | 100% (0 false alarms) | 1.9 s, 70 MB (2 processes); 2.3 s with `--jobs 1` |
 
+The two speed figures were measured in round 2 on a quieter machine; on the
+busier one used in round 3 the same 20 000 files took 3.8-6.5 s (round 2's
+code 6.5-11.6 s there), so compare runs on one machine, not columns.
+
 It is a regression gate too (`tests/test_benchmark.py`). Do not read 100% as
 "finds everything": it is 100% of what the generator plants. Not planted, so
 not measured: computed `import(x)`, bundler aliases, `.vue` / `.svelte`,
@@ -578,7 +621,7 @@ Where those tools are stronger, the table says so.
 | Grandfathering / adoption | `baseline` (+ `--ratchet`) + `drift` | not on the linked page | "incremental adoption" | not described on the README | `--formatter=baseline` |
 | Reads decision records, reports which ADRs enforce nothing | yes (`coverage`) | no | no | no | no |
 | CI output | human, JSON, GitHub annotations, SARIF, PR comment (Markdown) | not on the linked page | terminal, DOT, JSON | err, dot, html, mermaid, json, csv | table, GitHub Actions, JUnit, Code Climate, JSON, Graphviz, Mermaid |
-| Graph pictures | no | not on the linked page | yes (DOT, web) | yes (dot, mermaid, html) | yes (Graphviz, Mermaid) |
+| Graph pictures | `graph` (Mermaid, DOT, JSON; text only, no web viewer) | not on the linked page | yes (DOT, web) | yes (dot, mermaid, html) | yes (Graphviz, Mermaid) |
 | Install footprint | Python stdlib only | Python package | Rust-built Python package | Node.js package | PHP package |
 
 Also relevant, not compared cell by cell: [ArchUnit](https://www.archunit.org/)
@@ -629,6 +672,15 @@ and keeps waivers and the baseline honest.
 - Windows: files are always read and written as UTF-8, and on a console that
   can't show the check marks (cp1252 pipes) the report falls back to
   `[ok]`/`[x]`.
+- `suggest` only sees imports between the layers of `arch.yaml`; its
+  `layer-order` fixes an order for layers that never import each other
+  (alphabetical, and it says so), and its output describes the code today,
+  not what you intend.
+- `rules-diff` compares the rule texts, layers and waivers; it does not
+  re-check the code, and ignores ADRs and `arch.yaml` files over 2 MiB.
+- The regex time budget needs POSIX signals (see *Hostile repositories*).
+  Config files read by the import resolvers (tsconfig, go.mod, composer)
+  are still followed through symbolic links and not size-limited.
 - Rules are only as good as the constraints you write - `init` scaffolds
   layers from the folder layout and writes no rule for you.
 

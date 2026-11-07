@@ -29,8 +29,10 @@ from . import engine as engine_mod
 from . import codeowners as codeowners_mod
 from . import githelp
 from . import governance as governance_mod
+from . import graphs as graphs_mod
 from . import langs as langs_mod
 from . import report as report_mod
+from . import rulediff as rulediff_mod
 from . import resolve as resolve_mod
 from . import scanner as scanner_mod
 
@@ -609,7 +611,14 @@ def cmd_drift(args) -> int:
     go_module = langs_mod.go_module_path(root)
     resolver = resolve_mod.Resolver(root)
 
+    limit = scanner_mod.max_file_bytes()
+
     def entry(path, data, sink):
+        if limit and len(data) > limit:
+            sink.warn(f"{path}: cannot read ({len(data)} bytes, over the "
+                      f"{limit}-byte limit (ADR_DRIFT_MAX_FILE_BYTES)); "
+                      "not checked")
+            return None
         imports, _eng = scanner_mod.extract_imports(
             path, data, diag=sink, go_module=go_module, resolver=resolver)
         return (path, engine_mod._file_layer(layers, path), imports,
@@ -620,12 +629,14 @@ def cmd_drift(args) -> int:
         if c.status == "R":
             renames[c.old_path] = c.path
         now = blobs.get(c.new_blob) if c.new_blob and _is_source(c.path) else None
-        if now is not None:
-            now_entries.append(entry(c.path, now, diag))
+        got = entry(c.path, now, diag) if now is not None else None
+        if got is not None:
+            now_entries.append(got)
         old = (blobs.get(c.old_blob)
                if c.old_blob and _is_source(c.old_path) else None)
-        if old is not None:
-            base_entries.append(entry(c.old_path, old, quiet))
+        got = entry(c.old_path, old, quiet) if old is not None else None
+        if got is not None:
+            base_entries.append(got)
 
     repo_paths = None
     if any(engine_mod._complex_globs(l) for l in layers):
@@ -725,6 +736,84 @@ def cmd_coverage(args) -> int:
         print(f"error: {len(expired)} waiver"
               f"{'' if len(expired) == 1 else 's'} expired", file=sys.stderr)
     return 1 if (failed or expired) else 0
+
+
+def _layers_or_report(args):
+    """(loaded, entries, graph) for `graph` and `suggest`, or None."""
+    loaded = _load_or_report(args.root, args.adr_dir)
+    if loaded is None:
+        return None
+    if not loaded.layers:
+        print("error: arch.yaml defines no layers; run `adr-drift init` "
+              "first", file=sys.stderr)
+        return None
+    diag = diag_mod.Diagnostics()
+    entries, _seen = engine_mod.scan_entries(
+        args.root, loaded.layers, loaded.rules, False, diag, args.jobs)
+    return loaded, entries, graphs_mod.layer_graph(entries, loaded.layers)
+
+
+def cmd_graph(args) -> int:
+    got = _layers_or_report(args)
+    if got is None:
+        return 2
+    graph = got[2]
+    if args.format == "json":
+        print(json.dumps(graphs_mod.as_json(graph), indent=2))
+    else:
+        print(graphs_mod.mermaid(graph) if args.format == "mermaid"
+              else graphs_mod.dot(graph), end="")
+    return 0
+
+
+def cmd_suggest(args) -> int:
+    got = _layers_or_report(args)
+    if got is None:
+        return 2
+    loaded, _entries, graph = got
+    result = graphs_mod.suggest(graph, {r.kind for r in loaded.rules})
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+        return 0
+    if result["rules"]:
+        print("# These hold in the code today. Review, then paste under "
+              "`rules:` in arch.yaml\n# (or into an ADR's ## Constraints):")
+        for r in result["rules"]:
+            print(f'  - "{r}"')
+    else:
+        print("nothing to suggest")
+    for n in result["notes"]:
+        print(f"note: {report_mod.escape_terminal(n)}", file=sys.stderr)
+    return 0
+
+
+def cmd_rules_diff(args) -> int:
+    root = args.root
+    try:
+        githelp.require_repo(root)
+        base = githelp.resolve_commit(root, args.since)
+        head = githelp.resolve_commit(root, "HEAD")
+        old = rulediff_mod.load_at(root, base, args.adr_dir)
+        new = rulediff_mod.load_at(root, head, args.adr_dir)
+    except githelp.GitError as e:
+        return _git_failed(e)
+    result = rulediff_mod.compare(old, new)
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        esc = report_mod.escape_terminal
+        for key, title in (("weakened", "Weakened"),
+                           ("strengthened", "Strengthened"),
+                           ("notes", "Also")):
+            if result[key]:
+                print(f"{title}:")
+                for item in result[key]:
+                    print(f"  - {esc(item)}")
+        if not any(result.values()):
+            print(f"no rule changes since {esc(args.since)}")
+    if args.fail_on_weakened and result["weakened"]:
+        return 1
+    return 0
 
 
 def cmd_new(args) -> int:
@@ -927,6 +1016,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Exit 1 when fewer than PERCENT of the ADRs in force "
                         "enforce at least one rule.")
 
+    r = sub.add_parser("rules-diff", parents=where,
+                       help="How the rules changed since a git ref.")
+    r.add_argument("--since", default="HEAD~1", metavar="REF",
+                   help="Compare HEAD with this ref (default HEAD~1). "
+                        "Only committed files are read.")
+    r.add_argument("--format", choices=["human", "json"], default="human")
+    r.add_argument("--fail-on-weakened", action="store_true",
+                   help="Exit 1 when a rule was removed, an ADR retired or "
+                        "a waiver added or extended.")
+
+    g = sub.add_parser("graph", parents=where,
+                       help="Draw how the layers import each other.")
+    g.add_argument("--format", choices=["mermaid", "dot", "json"],
+                   default="mermaid")
+    g.add_argument("--jobs", type=_jobs_arg, default=0, metavar="N",
+                   help="Read files in N processes.")
+    u = sub.add_parser("suggest", parents=where,
+                       help="Propose rules that already hold in the code.")
+    u.add_argument("--format", choices=["human", "json"], default="human")
+    u.add_argument("--jobs", type=_jobs_arg, default=0, metavar="N",
+                   help="Read files in N processes.")
+
     n = sub.add_parser("new", parents=where,
                        help="Create the next-numbered ADR.")
     n.add_argument("title")
@@ -1057,8 +1168,18 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def _main(argv) -> int:
     args = parse_args(argv)
+    try:
+        return _dispatch(args)
+    except engine_mod.RuleTooSlow as e:
+        print(f"error: {report_mod.escape_terminal(str(e))}", file=sys.stderr)
+        return 2
+
+
+def _dispatch(args) -> int:
     return {"init": cmd_init, "check": cmd_check, "baseline": cmd_baseline,
             "drift": cmd_drift, "coverage": cmd_coverage, "new": cmd_new,
+            "graph": cmd_graph, "suggest": cmd_suggest,
+            "rules-diff": cmd_rules_diff,
             "index": cmd_index}[args.cmd](args)
 
 

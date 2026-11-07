@@ -152,6 +152,13 @@ def parse_rule_line(line: str, source: str = "",
             re.compile(rule.regex)  # validate early
         except re.error as e:
             raise ValueError(f"bad {kind} regex in {line.strip()!r}: {e}")
+        except (RecursionError, OverflowError, MemoryError) as e:
+            # `((((...a...))))` nested thousands deep: Python gives up with
+            # a traceback (exit 1, which reads as "violations found").
+            what = ("nested too deeply" if isinstance(e, RecursionError)
+                    else "too large")
+            raise ValueError(f"bad {kind} regex: it is {what} to compile "
+                             f"({line.strip()[:60]!r}...)")
     return rule
 
 
