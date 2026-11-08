@@ -45,7 +45,7 @@ metadata and the checklist asks Dan to confirm it.
 - Tests before: 553 passed, 182 subtests (pytest). After: 590 passed and 1
   skipped (the `hypothesis` test, which runs when that module is installed:
   591 passed in a scratch venv), 234 subtests; `python -m unittest discover
-  -s tests` on the unpacked sdist: 590 tests OK on Python 3.11, 3.12 and 3.13
+  -s tests` on the unpacked sdist: 591 tests OK (1 skipped) on Python 3.11, 3.12 and 3.13
   (3.10 and 3.14 not available here).
 - New files: `tests/test_round5.py` (36 tests), `tests/test_golden.py`
   (5 golden files), `benchmarks/mutants.py`, `adr_drift/paths.py`.
