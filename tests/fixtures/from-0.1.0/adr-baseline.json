@@ -1,0 +1,30 @@
+[
+  {
+    "rule": "src/handlers/**.py must contain /authenticate\\(/",
+    "rule_source": "/work/project/docs/adr/0001-record-architecture-decisions.md:6",
+    "file": "src/handlers/a.py",
+    "line": 0,
+    "detail": "missing /authenticate\\(/"
+  },
+  {
+    "rule": "src/handlers/**.py must contain /authenticate\\(/",
+    "rule_source": "/work/project/docs/adr/0002-no-handlers-import-db.md:6",
+    "file": "src/handlers/a.py",
+    "line": 0,
+    "detail": "missing /authenticate\\(/"
+  },
+  {
+    "rule": "handlers must not import db",
+    "rule_source": "arch.yaml:1",
+    "file": "src/handlers/a.py",
+    "line": 1,
+    "detail": "imports src.db.conn"
+  },
+  {
+    "rule": "handlers must not import db",
+    "rule_source": "/work/project/docs/adr/0002-no-handlers-import-db.md:4",
+    "file": "src/handlers/a.py",
+    "line": 1,
+    "detail": "imports src.db.conn"
+  }
+]

@@ -16,6 +16,7 @@ import re
 import sys
 import tokenize
 
+from . import paths as paths_mod
 from . import langs
 
 PY_EXTS = {".py"}
@@ -230,7 +231,9 @@ def max_file_bytes() -> int:
 
 
 def _inside(root_real: str, path: str) -> bool:
-    real = os.path.realpath(path)
+    # normcase: Windows paths differ by case and by '/' vs '\\' only.
+    real = os.path.normcase(os.path.realpath(path))
+    root_real = os.path.normcase(root_real)
     return real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep)
 
 
@@ -251,8 +254,7 @@ def iter_source_files(root: str, skipped: "list | None" = None) -> list[str]:
                 full = os.path.join(dirpath, fn)
                 if os.path.islink(full) and not _inside(root_real, full):
                     if skipped is not None:
-                        skipped.append((os.path.relpath(full, root).replace(
-                            os.sep, "/"),
+                        skipped.append((paths_mod.rel_posix(full, root),
                             "symbolic link to a file outside the repository"))
                     continue
                 out.append(full)

@@ -1,0 +1,17 @@
+::error file=src/handlers/a.py,line=2,title=adr-drift%3A forbid-transitive::reaches db (rule: handlers must not reach db through imports, from arch.yaml:9); ends in src/db/conn.py after 1 import; src/handlers/a.py:2 imports src.db.conn
+::error file=src/handlers/b.py,line=1,title=adr-drift%3A forbid-transitive::reaches db (rule: handlers must not reach db through imports, from arch.yaml:9); ends in src/db/conn.py after 1 import; src/handlers/b.py:1 imports src.db.conn
+::error file=src/handlers/b.py,line=1,title=adr-drift%3A forbid-import::imports src.db.conn (rule: handlers must not import db, from docs/adr/0001-layers.md:9)
+✗ 3 architecture violation(s):
+
+  src/handlers/a.py
+    src/handlers/a.py:2: reaches db
+      ends in src/db/conn.py after 1 import
+      src/handlers/a.py:2 imports src.db.conn
+      rule: handlers must not reach db through imports (arch.yaml)
+  src/handlers/b.py
+    src/handlers/b.py:1: reaches db
+      ends in src/db/conn.py after 1 import
+      src/handlers/b.py:1 imports src.db.conn
+      rule: handlers must not reach db through imports (arch.yaml)
+    src/handlers/b.py:1: imports src.db.conn
+      rule: handlers must not import db (docs/adr/0001-layers.md)

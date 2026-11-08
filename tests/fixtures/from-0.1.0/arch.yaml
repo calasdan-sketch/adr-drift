@@ -1,0 +1,7 @@
+layers:
+  - name: handlers
+    paths: ["src/handlers/**"]
+  - name: db
+    paths: ["src/db/**"]
+rules:
+  - "forbid-import: handlers -> db"

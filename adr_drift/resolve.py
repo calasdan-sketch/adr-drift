@@ -31,6 +31,7 @@ import posixpath
 import re
 
 from . import langs
+from . import paths as paths_mod
 from . import miniyaml
 
 _TS_NAMES = ("tsconfig.json", "jsconfig.json")
@@ -254,7 +255,7 @@ class Resolver:
                 continue                  # stays inside the repository
             for hit in sorted(glob.glob(os.path.join(self.root, pat),
                                         recursive=True)):
-                rel = os.path.relpath(hit, self.root).replace(os.sep, "/")
+                rel = paths_mod.rel_posix(hit, self.root)
                 if rel.startswith("..") or "node_modules" in rel.split("/"):
                     continue
                 if os.path.isfile(os.path.join(hit, "package.json")):

@@ -32,6 +32,8 @@ import re
 import unicodedata
 import urllib.parse
 
+from . import __author__
+
 INFORMATION_URI = "https://github.com/calasdan-sketch/adr-drift"
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 
@@ -218,6 +220,7 @@ def sarif_log(violations, version: str, identity, prefix: str = "",
             "tool": {"driver": {
                 "name": "adr-drift",
                 "version": version,
+                "organization": __author__,
                 "informationUri": INFORMATION_URI,
                 "rules": rules,
             }},

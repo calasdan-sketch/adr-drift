@@ -9,8 +9,10 @@ import functools
 import os
 import re
 import signal
+import sys
 import threading
 
+from . import paths as paths_mod
 from . import config as config_mod
 from . import diag as diag_mod
 from . import langs
@@ -140,7 +142,7 @@ def not_baselined(violations: "list[Violation]",
 
 
 def _rel(root: str, path: str) -> str:
-    return os.path.relpath(path, root).replace(os.sep, "/")
+    return paths_mod.rel_posix(path, root)
 
 
 def _file_layer(layers: list[dict], rel_path: str) -> str:
@@ -490,7 +492,8 @@ def no_import_warnings(seen: dict, all_rules: list[rules_mod.Rule]
     """One warning per language whose files all came back without a single
     import while forbid-import rules exist: the extractor is heuristic, and
     a rule that cannot see any import enforces nothing."""
-    if not any(r.kind == "forbid-import" for r in all_rules):
+    if not any(r.kind in ("forbid-import", "forbid-transitive")
+               for r in all_rules):
         return []
     out = []
     for lang in sorted(seen):
@@ -563,7 +566,13 @@ def coverage_warnings(entries: list, layers: list[dict],
         empty.append(name)
     for rule in all_rules:
         where = rule.where()
-        if rule.kind == "forbid-import":
+        if rule.scope and not any(rule.in_scope(rel)
+                                  for rel, _l, _i, _c in entries):
+            out.append(f"{where}: the scope of this ADR "
+                       f"({', '.join(rule.scope)}) matches no scanned "
+                       f"source file, so rule '{rule.describe()}' "
+                       "enforces nothing")
+        if rule.kind in ("forbid-import", "forbid-transitive"):
             if (not any(_from_hit(rule, rel, layer)
                         for rel, layer, _i, _c in entries)
                     and not any(rules_mod.match_pat(rule.from_pat, n)
@@ -674,10 +683,21 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
         layers, known_suffixes(repo_paths if repo_paths is not None
                        else (e[0] for e in entries))
         if needs_files else None)
+    graph_cache: dict = {}
+    all_entries = entries
     for rule in all_rules:
+        # An ADR's `Scope:` narrows the files a rule judges (a monorepo's
+        # per-service ADR); what the rule can see through (imports of other
+        # files) is still the whole repository.
+        entries = ([e for e in all_entries if rule.in_scope(e[0])]
+                   if rule.scope else all_entries)
         if rule.kind == "forbid-cycles":
             violations.extend(_cycle_violations(rule, entries, layers,
                                                 index))
+        elif rule.kind == "forbid-transitive":
+            violations.extend(_transitive_violations(
+                rule, entries, all_entries, layers, repo_paths,
+                graph_cache))
         elif rule.kind in ("layer-order", "only-import", "public-api"):
             violations.extend(_layer_rule_violations(rule, entries, layers,
                                                      index))
@@ -716,6 +736,163 @@ def evaluate(entries: list[tuple[str, str, list[tuple[str, int]], str]],
                                 detail=f"missing /{rule.regex}/"))
     violations.sort(key=lambda v: (v.file, v.line))
     return violations
+
+
+# -- forbid-transitive ----------------------------------------------------------
+
+#: Steps of a chain of imports that a report lists.
+_MAX_CHAIN_SHOWN = 12
+
+#: Files that stand for their directory when a package is imported.
+_PACKAGE_STEMS = ("__init__", "index", "mod")
+
+
+class _FileGraph:
+    """Which repository file imports which, for the files of one run.
+
+    An import is followed only when its name picks out one file (or one
+    package) of the repository; a name that fits several files (`utils` in
+    two services) is counted in `ambiguous` and not followed, and one that
+    fits none (a library) is not a file of the repo. The result is a graph
+    that can only be smaller than the truth, so a chain it reports is real
+    and the report says how many imports it could not follow."""
+
+    def __init__(self, entries: list, repo_paths=None):
+        files = sorted({e[0] for e in entries})
+        universe = sorted(set(repo_paths) | set(files)) if repo_paths \
+            else files
+        self.known = known_suffixes(universe)
+        self.by_stem: "dict[str, list[str]]" = {}
+        for rel in universe:
+            self.by_stem.setdefault(rel.rsplit(".", 1)[0], []).append(rel)
+        self.in_scan = set(files)
+        self.ambiguous = 0
+        self._cache: dict = {}
+        self.edges: "dict[str, list[tuple[str, int, str]]]" = {}
+        self.back: "dict[str, list[str]]" = {}
+        for rel, _layer, imports, _content in sorted(entries,
+                                                     key=lambda e: e[0]):
+            seen: set = set()
+            out = []
+            for mod, lineno in sorted(imports, key=lambda m: (m[1], m[0])):
+                for target in self.resolve(mod, rel.endswith(".py")):
+                    if target != rel and target not in seen:
+                        seen.add(target)
+                        out.append((target, lineno, mod))
+            self.edges[rel] = out
+            for target, _l, _m in out:
+                self.back.setdefault(target, []).append(rel)
+
+    def resolve(self, mod: str, python: bool = False) -> "list[str]":
+        hit = self._cache.get((mod, python))
+        if hit is not None:
+            return hit
+        pieces = rules_mod._norm(mod.replace("/", ".")).strip(".").split(".")
+        found: "list[str]" = []
+        for n in range(len(pieces), max(0, len(pieces) - 3), -1):
+            extra = pieces[n:]
+            cands: "set[str]" = set()
+            for rep in self.known.get(".".join(pieces[:n]), ()):
+                if not rep.endswith("/"):
+                    if len(extra) <= 2:
+                        cands.add(rep)
+                    continue
+                if len(extra) > 1:
+                    continue
+                if extra:
+                    cands.update(self.by_stem.get(rep + extra[0], ()))
+                else:
+                    cands.update(f for stem in _PACKAGE_STEMS
+                                 for f in self.by_stem.get(rep + stem, ()))
+            cands &= self.in_scan
+            if python and pieces[0] in sys.stdlib_module_names:
+                # `import json` is the standard library unless the repo has
+                # a top-level json: a utils/json.py is not what it names.
+                cands = {c for c in cands
+                         if c.split("/")[0].rsplit(".", 1)[0] == pieces[0]}
+            if len(cands) == 1:
+                found = sorted(cands)
+                break
+            if len(cands) > 1:
+                self.ambiguous += 1
+                break
+        self._cache[(mod, python)] = found
+        return found
+
+
+def _file_names(rel: str) -> "list[str]":
+    parts = rel.split("/")
+    parts[-1] = parts[-1].rsplit(".", 1)[0]
+    return [".".join(parts[i:]) for i in range(len(parts))]
+
+
+def _transitive_violations(rule: rules_mod.Rule, subjects: list,
+                           entries: list, layers: list[dict], repo_paths,
+                           cache: dict) -> "list[Violation]":
+    """forbid-transitive: a file the rule covers must not reach a file of
+    the target by any chain of imports, however long. One violation per
+    such file, naming the shortest chain (ties: the alphabetically first)
+    and the import behind each step."""
+    graph = cache.get("graph")
+    if graph is None:
+        graph = cache["graph"] = _FileGraph(entries, repo_paths)
+    layer_of = {e[0]: e[1] for e in entries}
+    targets = [rel for rel in sorted(
+                   graph.edges, key=lambda r: (
+                       r.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                       in _PACKAGE_STEMS, r))
+               if (layer_of[rel]
+                   and rules_mod.match_pat(rule.to_pat, layer_of[rel]))
+               or any(rules_mod.match_pat(rule.to_pat, n)
+                      for n in _file_names(rel))]
+    tset = set(targets)
+    # Breadth first from the targets over reversed edges: every file gets
+    # its distance to the nearest target and the next file on that way.
+    nxt: "dict[str, tuple[str, int, str]]" = {}
+    dist = {t: 0 for t in targets}
+    final = {t: t for t in targets}       # the target a file's way ends at
+    queue = collections.deque(targets)
+    while queue:
+        cur = queue.popleft()
+        for src in sorted(graph.back.get(cur, ())):
+            if src in dist:
+                continue
+            for target, lineno, mod in graph.edges[src]:
+                if target == cur:
+                    nxt[src] = (target, lineno, mod)
+                    break
+            dist[src] = dist[cur] + 1
+            final[src] = final[cur]
+            queue.append(src)
+    out: "list[Violation]" = []
+    for rel, layer, _imports, _content in sorted(subjects,
+                                                 key=lambda e: e[0]):
+        if rel in tset or rel not in nxt or not _from_hit(rule, rel, layer):
+            continue
+        chain: "list[str]" = []
+        cur = rel
+        while cur not in tset and len(chain) < _MAX_CHAIN_SHOWN:
+            step = nxt[cur]
+            chain.append(f"{cur}:{step[1]} imports {step[2]}")
+            cur = step[0]
+        # The chain's end is known from the distances; only the first steps
+        # are listed, so a very long chain costs a line, not a page.
+        end = final[rel]
+        steps = dist[rel]
+        if steps > len(chain):
+            chain.append(f"... and {steps - len(chain)} more import"
+                         f"{'' if steps - len(chain) == 1 else 's'}")
+        first = nxt[rel]
+        # The detail is the identity (baselines, SARIF): "this file reaches
+        # the target" must not change when unrelated code makes the shortest
+        # chain longer, shorter or end in another file of the target. Which
+        # file and how long go first in the evidence.
+        chain.insert(0, f"ends in {end} after {steps} "
+                        f"import{'' if steps == 1 else 's'}")
+        out.append(Violation(
+            rule=rule, file=rel, line=first[1],
+            detail=f"reaches {rule.to_pat}", evidence=chain))
+    return out
 
 
 # -- layer-order, only-import, public-api ----------------------------------

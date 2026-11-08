@@ -75,3 +75,18 @@ to 17 on 2 CPUs because other jobs shared the machine: round 3 6.1 s and
 11.2 s, round 4 8.5 s and 7.4 s in two back-to-back pairs. That is noise, not
 a difference; the scan code did not change in round 4 (only error handling
 and the Windows job limit). The 1.9 s above is from a quiet machine.
+
+## Round 5 (2026-11-08)
+
+Detection on the generated corpus is unchanged by round 5: 497 / 497, 0 false
+alarms. Speed, `bench.py --code <round-4 tree>` against this tree back to back
+on a machine with a load average of 8-14 on 2 CPUs: round 4 6.9 s and 5.7 s,
+round 5 5.6 s and 4.8 s for 19 998 files (the seconds are not comparable with
+the table above; only "no slower" is supported). `forbid-transitive` is not
+in this benchmark: by hand, 6 000 files in one chain took about 3 s and 3 000
+files with 20 imports each about 5 s on the same loaded machine.
+
+`mutants.py` flips one condition at a time in a copy of the engine, the rule
+parser and the config reader (18 mutations) and runs the new tests against
+each: 18 killed, 0 survived. Five more mutants were tried and dropped as
+equivalent (see the comment in the file).

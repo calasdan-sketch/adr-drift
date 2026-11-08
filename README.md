@@ -7,8 +7,11 @@ Ruby and PHP, with no dependencies beyond the Python standard library.
 
 - Rules live in your ADRs (`## Constraints`) or in `arch.yaml`; a superseded,
   deprecated or rejected ADR stops being enforced, and says so.
-- Layer imports, layer order, allow-lists, public-API boundaries, forbidden
-  or required code patterns, and dependency cycles between layers.
+- Layer imports (direct, or through any chain of imports with
+  `forbid-transitive`), layer order, allow-lists, public-API boundaries,
+  forbidden or required code patterns, and dependency cycles between layers.
+- One repository, many services: an ADR can say `Scope: services/api/**` and
+  its rules then judge only those files.
 - Resolves what the import statement does not say: tsconfig `paths` and
   `baseUrl`, monorepo workspace packages, the nearest `go.mod`, composer
   PSR-4 namespaces, `importlib.import_module("literal")`.
@@ -110,10 +113,40 @@ forbid-import: handlers -> db.drivers     # layering: handlers may not import dr
 forbid-pattern: src/**.py !~ \beval\(     # no eval() anywhere in src/
 require-pattern: src/handlers/**.py =~ authenticate\(   # handlers must authenticate
 forbid-cycles: *                          # no two layers depend on each other in a loop
+forbid-transitive: handlers -> db         # ... not even through services: any chain of imports
 layer-order: handlers > services > db     # a layer imports only layers to its right
 only-import: util -> util                 # util may import no other layer of this repo
 public-api: db -> db.api, db.models       # outside db, import only these modules
 ```
+
+`forbid-transitive: <from> -> <to>` is `forbid-import` for chains: a file of
+`<from>` must not reach a file of `<to>` through imports of other files of
+the repository, however many. One violation per file, naming the shortest
+chain and the import behind each step (the first 12 steps; a chain of 6 000
+costs one extra line). The finding itself is "this file reaches `<to>`", so a
+baseline does not break when unrelated code makes the chain longer:
+
+```
+  src/handlers/h.py
+    src/handlers/h.py:1: reaches db
+      ends in src/db/conn.py after 2 imports
+      src/handlers/h.py:1 imports src.services.svc
+      src/services/svc.py:1 imports src.db.conn
+      rule: handlers must not reach db through imports (arch.yaml)
+```
+
+An import is followed only when its name picks out exactly one file or
+package of the repository. A name that fits several files (`helper` in two
+services) is not followed (so a chain is never invented, but one can be
+missed: write the full path in the import or use `forbid-import` on the layer
+too), a Python name that is also a standard-library module (`json`) is not
+taken for a repo file `util/json.py`, and a library is not a file of the
+repository. It reads the same imports `forbid-import` does, so the language
+limits below apply. `check` and `baseline` judge it, `drift` does not (the
+chain can run through files that did not change; it says so on stderr).
+It is the thing import-linter does by default for its `forbidden`
+contracts (they catch indirect imports unless `allow_indirect_imports` is
+set; read from the 2.16 package source, 2026-11-07).
 
 `forbid-cycles: <layers>` covers the layers of `arch.yaml` whose name matches
 `<layers>` (`*` for all, `core*`, one name...). A layer depends on another
@@ -244,6 +277,36 @@ ADRs were read - `all ADRs hold (4 read)`, or `0 ADRs read (only the rules in
 arch.yaml were checked)` - and `drift` ends its line with the same count. With
 `--format json` stdout stays the bare array of violations; the warnings are
 on stderr.
+
+### One ADR per service: `Scope`
+
+In a repository with several services, an ADR kept in `services/api/adr/`
+usually means the API service. Say so and its rules judge only those files:
+
+```markdown
+# 7. API handlers never touch the database
+
+Status: Accepted
+Scope: services/api/**, libs/api-common/**
+
+## Constraints
+
+- forbid-import: handlers -> db
+```
+
+`Scope:` is a line above the first `##` heading, or `scope:` in the front
+matter (`scope: [a/**, b/**]` or a list). The globs are relative to the
+repository root and are alternatives. Without `Scope` the rules apply
+everywhere, as before. The scope narrows the files a rule *judges*; what a
+rule looks through (the imports of other files, for `forbid-transitive`) is
+still the whole repository. Because a scope that matches nothing would make
+the rule enforce nothing and look green, it is a warning (`--strict`: exit
+2); an absolute path, `..`, `**` alone, more than 50 globs or a line over
+2 000 characters is an error; a `Scope:` line that reads like a sentence
+(it has spaces) is ignored with a warning, so prose never switches
+enforcement off. `rules-diff` reports a changed scope as the old rule gone
+and a new one added, and `coverage` shows each ADR's scope. A waiver names
+a rule by its text, which the scope does not change.
 
 ### The index, the sample ADR and the statuses
 
@@ -620,6 +683,7 @@ Where those tools are stronger, the table says so.
 | Where the rules live | your ADRs and `arch.yaml` | its own config (INI / TOML) | `tach.toml` | its own config file | its own config (unverified) |
 | Code patterns (forbid / require a regex) | yes | not on the linked page | not on the linked page | not on the linked page | not on the linked page |
 | Dependency cycles | between layers | `acyclic_siblings` contract | yes | yes (`--init` adds the rule) | not on the linked page |
+| Indirect imports (a to b through c) | `forbid-transitive` | `forbidden` contracts (indirect by default; `allow_indirect_imports`) | not on the linked page | not on the linked page | - |
 | Layer order / allow-lists / public API | `layer-order`, `only-import`, `public-api` | layers, independence, protected contracts | interfaces, `depends_on` | `forbidden` rules by path | - |
 | Other contract types | - | protected, independence | deprecated deps, ownership | orphans, missing / dev-only package.json deps | - |
 | Rule waivers with owner and expiry | yes (`waivers`) | not on the linked page | not on the linked page | not on the linked page | not on the linked page |
@@ -663,6 +727,10 @@ and keeps waivers and the baseline honest.
   violation for another in the same file is not seen, and with several
   identical violations in a file `drift` knows how many are new, not always
   which.
+- `forbid-transitive` follows an import only when its name picks out one file
+  or package of the repository (see its section); the shortest chain is
+  reported, not every chain; it needs the whole repository, so `drift` leaves
+  it to `check`. A scoped ADR (`Scope:`) judges only the files in its scope.
 - `forbid-cycles` works on the layers of `arch.yaml` only (not on modules
   or packages without a layer), reports one loop per group of layers that
   depend on each other (fix it and the next one may show), and is checked by
@@ -695,6 +763,13 @@ and keeps waivers and the baseline honest.
 ## Tests
 
 `python3 -m unittest discover -s tests` (or `python -m pytest -q`)
+
+Besides example tests: golden files for every output format
+(`tests/golden/`, regenerate on purpose with `ADR_DRIFT_UPDATE_GOLDEN=1`), a
+differential test of `forbid-transitive` against a plain reference
+(`tests/test_round5.py`; also run with `hypothesis` when it is installed),
+and `python3 benchmarks/mutants.py`, which flips one condition at a time in a
+copy of the code and reports any change the tests do not notice.
 
 `python3 benchmarks/bench.py` re-runs the detection and speed benchmark;
 `python3 benchmarks/compare.py` runs the tools above on one project (see

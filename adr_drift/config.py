@@ -14,6 +14,7 @@ import os
 import posixpath
 import re
 
+from . import paths as paths_mod
 from . import miniyaml
 from . import rules as rules_mod
 
@@ -440,6 +441,7 @@ def _load_rules(raw, lines, problems) -> "list[rules_mod.Rule]":
                    "'forbid-pattern: <glob> !~ <regex>', "
                    "'require-pattern: <glob> =~ <regex>', "
                    "'forbid-cycles: <layers>', "
+                   "'forbid-transitive: <from> -> <to>', "
                    "'layer-order: <a> > <b> > <c>', "
                    "'only-import: <layer> -> <a>, <b>' or "
                    "'public-api: <layer> -> <module>')"))
@@ -474,16 +476,17 @@ def adr_files(root: str, adr_dir: str = DEFAULT_ADR_DIR,
         found.extend(os.path.join(dirpath, f) for f in filenames
                      if f.endswith(".md") and f != "README.md")
     return sorted(
-        found, key=lambda p: os.path.relpath(p, d).replace(os.sep, "/"))
+        found, key=lambda p: paths_mod.rel_posix(p, d))
 
 
 def _dir_list(adr_dir) -> "list[str]":
     """--adr-dir as a list: None (search), one name, or several."""
     if adr_dir is None:
         return []
+    # `--adr-dir docs\adr`, as typed on Windows, means docs/adr everywhere.
     if isinstance(adr_dir, str):
-        return [adr_dir]
-    return list(adr_dir)
+        return [adr_dir.replace("\\", "/")]
+    return [d.replace("\\", "/") for d in adr_dir]
 
 
 def _same_dir(a: str, b: str) -> bool:
@@ -753,6 +756,84 @@ def adr_owners(lines: "list[str]") -> "list[str]":
     return []
 
 
+_SCOPE_KEYS = ("scope", "scopes")
+_SCOPE_LINE_RE = re.compile(
+    r"[ \t]*(?:[-*+][ \t]+)?(?:\*\*|__)?(scopes?)(?:\*\*|__)?[ \t]*:"
+    r"(?:\*\*|__)?[ \t]*(.+)$", re.IGNORECASE)
+_MAX_SCOPE = 50
+
+
+class _ProseScope(ValueError):
+    """A `Scope:` line that reads as a sentence, not as globs."""
+
+
+def _scope_problem(glob: str) -> "str | None":
+    g = glob.replace("\\", "/")
+    if g.startswith("/") or re.match(r"[A-Za-z]:", g):
+        return "must be relative to the repository root"
+    if ".." in g.split("/"):
+        return "must not contain '..'"
+    if not g.strip("/*"):
+        return "would match every file (leave the Scope out instead)"
+    return None
+
+
+def adr_scope(lines: "list[str]") -> "list[str]":
+    """The files an ADR's rules are about, for a repository with several
+    services: the front matter's `scope:` (a comma-separated list or a block
+    list) or a `Scope:` line above the first `##` heading, as repo-relative
+    globs. [] when the ADR names none (its rules apply everywhere).
+    Raises ValueError for a glob that is absolute, climbs out with '..' or
+    covers everything, so a scope can not be used to point outside."""
+    lines = _without_fences(lines)
+    front, start = _front_matter(lines)
+    names: "list[str]" = []
+    for i, line in enumerate(front):
+        m = re.match(r"([A-Za-z_-]+)[ \t]*:[ \t]*(.*)$", line)
+        if not m or m.group(1).lower() not in _SCOPE_KEYS:
+            continue
+        value = _yaml_scalar(m.group(2))
+        if not value:
+            for nxt in front[i + 1:]:
+                bullet = re.match(r"[ \t]*-[ \t]+(.+)$", nxt)
+                if not bullet:
+                    break
+                names.append(_yaml_scalar(bullet.group(1)))
+        else:
+            names = _split_globs(value)
+        break
+    else:
+        for line in lines[start:start + _STATUS_ZONE]:
+            if _H2_RE.match(line):
+                break
+            m = _SCOPE_LINE_RE.match(line)
+            if m:
+                names = _split_globs(m.group(2))
+                break
+    names = [n for n in names if n]
+    if len(names) > _MAX_SCOPE:
+        # Dropping the rest would shrink the scope without a word.
+        raise ValueError(f"scope lists {len(names)} globs; at most "
+                         f"{_MAX_SCOPE} are read - use fewer, wider globs")
+    for n in names:
+        if re.search(r"\s", n):
+            raise _ProseScope(
+                f"the Scope line {n[:60]!r} looks like a sentence, not "
+                "globs, so it is ignored and the rules apply everywhere "
+                "(write globs without spaces, like 'services/api/**')")
+        why = _scope_problem(n)
+        if why:
+            raise ValueError(f"scope {n!r} {why}")
+    return [n.replace("\\", "/") for n in names]
+
+
+def _split_globs(value: str) -> "list[str]":
+    value = value.strip().strip("[]")
+    if len(value) > 2000:
+        raise ValueError("scope line is longer than 2000 characters")
+    return [n.strip().strip("'\"` ") for n in value.split(",")]
+
+
 def adr_decision(lines: "list[str]", limit: int = 400) -> str:
     """The first words of the `## Decision` (or `Decision Outcome`) section,
     on one line; "" when there is none."""
@@ -826,6 +907,15 @@ def parse_adr(path: str, display: "str | None" = None,
     info["title"] = title or info["title"]
     info["status"] = status
     info["owners"] = adr_owners(lines)
+    scope: "list[str]" = []
+    try:
+        scope = adr_scope(lines)
+    except _ProseScope as e:
+        info["warnings"].append(f"{shown}: {e}")
+    except ValueError as e:
+        if parse_rules:
+            raise ConfigError([f"{shown}: {e}"])
+    info["scope"] = scope
     info["decision"] = adr_decision(lines)
     info["code_refs"] = adr_code_refs(lines)
     if not parse_rules:
@@ -854,6 +944,7 @@ def parse_adr(path: str, display: "str | None" = None,
             problems.append(f"{_where(shown, number)}: {e}")
             continue
         if rule is not None:
+            rule.scope = list(scope)
             info["rules"].append(rule)
             continue
         hint = rules_mod.rule_like_problem(line, listed)
@@ -878,7 +969,7 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     search = find_adrs(root, adr_dir)
     warnings: "list[str]" = list(search.warnings)
     for p in search.files:
-        shown = os.path.relpath(p, root).replace(os.sep, "/")
+        shown = paths_mod.rel_posix(p, root)
         try:
             adrs.append(parse_adr(p, display=shown))
         except ConfigError as e:
@@ -890,7 +981,7 @@ def load_all(root: str, adr_dir=None) -> Loaded:
     all_rules = list(arch_rules)
     inactive: "list[tuple[str, str, int]]" = []
     for a in adrs:
-        shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+        shown = paths_mod.rel_posix(a["path"], root)
         if is_inactive_status(a["status"]) and a["rules"]:
             problem = _supersede_problem(a, adrs, shown)
             if problem:
@@ -902,8 +993,7 @@ def load_all(root: str, adr_dir=None) -> Loaded:
         if is_inactive_status(a["status"]):
             # A superseded or rejected decision must not keep failing CI;
             # its rules were still parsed, so a broken one is still an error.
-            inactive.append((os.path.relpath(a["path"], root).replace(
-                os.sep, "/"), a["status"], len(a["rules"])))
+            inactive.append((paths_mod.rel_posix(a["path"], root), a["status"], len(a["rules"])))
             continue
         all_rules.extend(a["rules"])
     known = {r.describe() for r in all_rules}

@@ -17,6 +17,7 @@ import datetime
 import os
 import re
 
+from . import paths as paths_mod
 from . import config as config_mod
 from . import rules as rules_mod
 
@@ -107,7 +108,7 @@ def coverage(root: str, loaded, day: datetime.date) -> dict:
     `retired` (superseded / deprecated / rejected)."""
     adrs = []
     for a in loaded.adrs:
-        shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+        shown = paths_mod.rel_posix(a["path"], root)
         retired = config_mod.is_inactive_status(a["status"])
         state = ("retired" if retired
                  else "enforced" if a["rules"] else "no-rule")
@@ -117,7 +118,8 @@ def coverage(root: str, loaded, day: datetime.date) -> dict:
         row = {"path": shown, "number": a["number"], "title": a["title"],
                "status": a["status"], "state": state,
                "rules": len(a["rules"]), "owners": list(a.get("owners", [])),
-               "missing_paths": dead}
+               "missing_paths": dead,
+               "scope": list(a.get("scope", []))}
         if state == "no-rule" and _PROSE_RULE_RE.search(
                 a.get("decision", "")):
             row["hint"] = ("the decision reads like a rule ('must not', "

@@ -1,0 +1,31 @@
+[
+  {
+    "rule": "handlers must not reach db through imports",
+    "rule_source": "arch.yaml:9",
+    "file": "src/handlers/a.py",
+    "line": 2,
+    "detail": "reaches db",
+    "evidence": [
+      "ends in src/db/conn.py after 1 import",
+      "src/handlers/a.py:2 imports src.db.conn"
+    ]
+  },
+  {
+    "rule": "handlers must not reach db through imports",
+    "rule_source": "arch.yaml:9",
+    "file": "src/handlers/b.py",
+    "line": 1,
+    "detail": "reaches db",
+    "evidence": [
+      "ends in src/db/conn.py after 1 import",
+      "src/handlers/b.py:1 imports src.db.conn"
+    ]
+  },
+  {
+    "rule": "handlers must not import db",
+    "rule_source": "docs/adr/0001-layers.md:9",
+    "file": "src/handlers/b.py",
+    "line": 1,
+    "detail": "imports src.db.conn"
+  }
+]

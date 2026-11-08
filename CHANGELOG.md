@@ -8,6 +8,48 @@ monorepo engineer, a CI lead, a governance lead and a skeptical tech lead)
 found missing. Benchmark on a generated seven-language corpus
 (`benchmarks/`): recall 63.2% -> 100%, precision 85.8% -> 100%.
 
+### Expert round 5 (still 0.3.0, unreleased): monorepos, chains of imports, the author line
+
+Panel (one author played each role and ran each command, see
+`docs/ROUND5.md`): a software architect, an import-linter / ArchUnit
+maintainer, a tech lead running ADRs in a monorepo, a Windows path expert,
+a test-methodology reviewer, and a user upgrading from the published 0.1.0.
+Release version stays 0.3.0: PyPI still has only 0.1.0, and everything here
+is additive to the unreleased 0.3.0.
+
+Added
+- `forbid-transitive: <from> -> <to>`: a file may not reach the target through
+  any chain of imports (what import-linter's `forbidden` contract does by
+  default). One violation per file, the shortest chain and the import behind
+  each step in the report; the finding is "reaches `<to>`", so a baseline
+  survives unrelated code lengthening the chain. `check` and `baseline`
+  judge it; `drift` says on stderr that it does not.
+- `Scope:` in an ADR (a line above the first `##`, or `scope:` in the front
+  matter): the ADR's rules judge only those files, for a repository with one
+  ADR folder per service. A scope that matches nothing is a warning; an
+  absolute path, `..`, `**` alone, more than 50 globs or a line over 2 000
+  characters is an error; a sentence after `Scope:` is ignored with a
+  warning. `rules-diff` reports a changed scope, `coverage` shows it.
+- Author: `__author__` and the SARIF `tool.driver.organization` are
+  "Calas Automations Inc."; `--help` ends with it; a test pins the string in
+  `pyproject.toml`, `LICENSE`, the code and the wheel's metadata.
+- Tests: golden files for all five output formats (`tests/golden/`), a
+  differential test of `forbid-transitive` against a plain reference
+  (40 seeded graphs, plus `hypothesis` when installed), a metamorphic test
+  of `Scope`, generated rule text, state files written by 0.1.0
+  (`tests/fixtures/from-0.1.0`), and `benchmarks/mutants.py` (18 one-line
+  mutations of the engine; all killed).
+
+Fixed
+- Windows: `--adr-dir` or an output path on another drive than the
+  repository raised `ValueError` (reported as an internal error) from
+  `os.path.relpath`; it is now shown as an absolute path (`adr_drift/paths.py`).
+  The symbolic-link containment check compares case-folded paths.
+- `--adr-dir docs\adr` (the Windows spelling) is read as `docs/adr` on every
+  platform; on Linux and macOS it used to be "not found".
+- Not a defect fixed but checked and recorded: files written by 0.1.0
+  (baseline with absolute paths, marker-less index, ADRs) work unchanged.
+
 ### Expert round 4 (still 0.3.0, unreleased): the first hour after `pip install`
 
 Panel (independent reviewers could not be spawned; one author played each

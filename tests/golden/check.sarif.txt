@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "adr-drift",
+          "version": "<version>",
+          "organization": "Calas Automations Inc.",
+          "informationUri": "https://github.com/calasdan-sketch/adr-drift",
+          "rules": [
+            {
+              "id": "forbid-transitive/d04f8f419e27",
+              "name": "forbid-transitive",
+              "shortDescription": {
+                "text": "handlers must not reach db through imports"
+              },
+              "fullDescription": {
+                "text": "handlers must not reach db through imports - declared in arch.yaml:9"
+              },
+              "helpUri": "https://github.com/calasdan-sketch/adr-drift#the-constraint-dsl",
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "architecture",
+                  "adr"
+                ],
+                "precision": "high"
+              }
+            },
+            {
+              "id": "forbid-import/ee53bc45d6ae",
+              "name": "forbid-import",
+              "shortDescription": {
+                "text": "handlers must not import db"
+              },
+              "fullDescription": {
+                "text": "handlers must not import db - declared in docs/adr/0001-layers.md:9"
+              },
+              "helpUri": "https://github.com/calasdan-sketch/adr-drift#the-constraint-dsl",
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "architecture",
+                  "adr"
+                ],
+                "precision": "high"
+              }
+            }
+          ]
+        }
+      },
+      "invocations": [
+        {
+          "executionSuccessful": true,
+          "toolExecutionNotifications": []
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "forbid-transitive/d04f8f419e27",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "reaches db (rule: handlers must not reach db through imports, from arch.yaml:9); ends in src/db/conn.py after 1 import; src/handlers/a.py:2 imports src.db.conn"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/handlers/a.py"
+                },
+                "region": {
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "adrDriftIdentity/v1": "0dd8e8a988fdb8fcbc5c1abe96da9a05a0b40dd38d680d6c7a96cedd86db80ee:1"
+          }
+        },
+        {
+          "ruleId": "forbid-transitive/d04f8f419e27",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "reaches db (rule: handlers must not reach db through imports, from arch.yaml:9); ends in src/db/conn.py after 1 import; src/handlers/b.py:1 imports src.db.conn"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/handlers/b.py"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "adrDriftIdentity/v1": "26dd0ee415f676ac626d0cd5257073da10c75b1b1b54138ba50ec3397c652d89:1"
+          }
+        },
+        {
+          "ruleId": "forbid-import/ee53bc45d6ae",
+          "ruleIndex": 1,
+          "level": "error",
+          "message": {
+            "text": "imports src.db.conn (rule: handlers must not import db, from docs/adr/0001-layers.md:9)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/handlers/b.py"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "adrDriftIdentity/v1": "29a3c9e8755f9a04a7d438243e397efa7f33e2927c1a0ea17cb8981f44261ea1:1"
+          }
+        }
+      ]
+    }
+  ]
+}

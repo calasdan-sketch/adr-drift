@@ -23,7 +23,8 @@ import re
 import sys
 import tempfile
 
-from . import __version__
+from . import paths as paths_mod
+from . import __author__, __version__
 from . import config as config_mod
 from . import diag as diag_mod
 from . import engine as engine_mod
@@ -137,6 +138,8 @@ ARCH_TEMPLATE = """# ADR Drift architecture config.
 #   require-pattern: <glob> =~ <regex> files matching <glob> must contain <regex>
 #   forbid-cycles: <layers>            the layers matching <layers> (e.g. *) must
 #                                      not depend on each other in a loop
+#   forbid-transitive: <from> -> <to> <from> may not reach <to> through any chain
+#                                      of imports, however long
 #   layer-order: a > b > c             a layer imports only layers to its right
 #   only-import: <layer> -> x, y       <layer> may import only layers x and y
 #   public-api: <layer> -> <module>    outside <layer>, only <module> is imported
@@ -271,7 +274,7 @@ def cmd_init(args) -> int:
         print(f"indexed {_write_index(root, adr_rel)} ADR(s) -> {readme}")
     print(f"wrote {config_mod.ARCH_FILE} "
           f"({len(layers)} layers: {', '.join(l['name'] for l in layers)})")
-    print(f"sample ADR: {os.path.relpath(sample, root)}"
+    print(f"sample ADR: {paths_mod.rel_posix(sample, root)}"
           + ("" if created else " (already there)"))
     if not ours:
         print(f"kept {readme}: adr-drift did not write it (`adr-drift index "
@@ -414,7 +417,7 @@ def _markdown(violations, loaded, root: str, prefix: str, diag,
               retired) -> str:
     adrs = {}
     for a in (loaded.adrs if loaded is not None else []):
-        shown = os.path.relpath(a["path"], root).replace(os.sep, "/")
+        shown = paths_mod.rel_posix(a["path"], root)
         adrs[shown] = a
     owners = codeowners_mod.load(_repo_top(root, prefix))
     note = (f"{len(diag.warnings)} warning"
@@ -598,7 +601,7 @@ def cmd_baseline(args) -> int:
            else os.path.join(root, args.output))
     _write_text(out, json.dumps([v.as_dict() for v in violations],
                                 indent=2) + "\n")
-    rel = os.path.relpath(out, root)
+    rel = paths_mod.rel_posix(out, root)
     print(f"wrote {len(violations)} baselined violation(s) -> {rel}")
     print(f"run `adr-drift check --baseline {rel}` to grandfather them.")
     return 0
@@ -634,17 +637,21 @@ def cmd_drift(args) -> int:
     _announce_inactive(loaded)
     if not all_rules:
         return _nothing_to_enforce(args)
-    # A cycle can run through files the range did not touch, and drift only
-    # reads the changed ones: it cannot judge forbid-cycles. Say so, and if
-    # nothing else is left, warn (a green drift would mean nothing).
-    cycles = [r for r in all_rules if r.kind == "forbid-cycles"]
-    all_rules = [r for r in all_rules if r.kind != "forbid-cycles"]
-    if cycles:
-        n = len(cycles)
-        text = (f"{n} forbid-cycles rule{'' if n == 1 else 's'} "
+    # A cycle or a chain of imports can run through files the range did not
+    # touch, and drift only reads the changed ones: it cannot judge
+    # forbid-cycles or forbid-transitive. Say so, and if nothing else is
+    # left, warn (a green drift would mean nothing).
+    whole = [r for r in all_rules
+             if r.kind in ("forbid-cycles", "forbid-transitive")]
+    all_rules = [r for r in all_rules
+                 if r.kind not in ("forbid-cycles", "forbid-transitive")]
+    if whole:
+        n = len(whole)
+        names = " and ".join(sorted({r.kind for r in whole}))
+        text = (f"{n} {names} rule{'' if n == 1 else 's'} "
                 f"{'is' if n == 1 else 'are'} checked by `adr-drift check`, "
-                "not by `drift` (a cycle can run through files that did not "
-                "change)")
+                "not by `drift` (the cycle or chain can run through files "
+                "that did not change)")
         if all_rules:
             print(f"note: {text}", file=sys.stderr)
         else:
@@ -782,9 +789,11 @@ def cmd_coverage(args) -> int:
             mark = {"enforced": sym("✓"), "no-rule": sym("✗"),
                     "retired": "-"}[row["state"]]
             owners = f"  [{', '.join(row['owners'])}]" if row["owners"] else ""
+            scope = (f"  scope: {report_mod.escape_terminal(', '.join(row['scope']))}"
+                     if row.get("scope") else "")
             print(f"  {mark} {row['path']}  {row['status'] or sym('—')}  "
                   f"{row['rules']} rule{'' if row['rules'] == 1 else 's'}"
-                  f"{owners}")
+                  f"{owners}{scope}")
             if row["state"] == "no-rule":
                 print("      nothing checks this decision: add a "
                       "## Constraints section")
@@ -904,7 +913,7 @@ def cmd_new(args) -> int:
     else:
         print("error: could not find a free ADR number", file=sys.stderr)
         return 2
-    print(f"created {os.path.relpath(path, args.root)}")
+    print(f"created {paths_mod.rel_posix(path, args.root)}")
     return 0
 
 
@@ -925,7 +934,7 @@ def _write_index(root: str, adr_rel: str) -> int:
              "| # | Title | Status |",
              "|---|-------|--------|"]
     for a in adrs:
-        rel = os.path.relpath(a["path"], adr_dir).replace(os.sep, "/")
+        rel = paths_mod.rel_posix(a["path"], adr_dir)
         status = _cell(a["status"]) or "\u2014"
         lines.append(f"| {a['number']} | [{_cell(a['title'])}]({rel}) "
                      f"| {status} |")
@@ -1022,7 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
                "usage error (an unparsable rule, no rules at all, a git "
                "problem, --strict with warnings). Warnings and errors go "
                "to stderr; stdout carries only the report (with --format "
-               "json always a JSON array).")
+               "json always a JSON array).\nMade by " + __author__)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     where = [_location_options(after_subcommand=True)]

@@ -6,3 +6,4 @@ recursive-include tests *.py
 recursive-include tests/fixtures *
 global-exclude __pycache__ *.py[cod]
 recursive-include benchmarks *.py *.md
+recursive-include tests/golden *

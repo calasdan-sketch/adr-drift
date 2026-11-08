@@ -1,0 +1,20 @@
+### adr-drift: 3 architecture violations
+
+**handlers must not import db**
+- ADR 0001 1. Handlers never import the db (`docs/adr/0001-layers.md`) · status: Accepted · decided by `Alice`
+
+| File | Line | Found | Owners |
+|---|---|---|---|
+| `src/handlers/b.py` | 1 | imports src.db.conn | - |
+
+**handlers must not reach db through imports**
+- from `arch.yaml`
+
+| File | Line | Found | Owners |
+|---|---|---|---|
+| `src/handlers/a.py` | 2 | reaches db | - |
+|  |  | ends in src/db/conn.py after 1 import |  |
+|  |  | src/handlers/a.py:2 imports src.db.conn |  |
+| `src/handlers/b.py` | 1 | reaches db | - |
+|  |  | ends in src/db/conn.py after 1 import |  |
+|  |  | src/handlers/b.py:1 imports src.db.conn |  |

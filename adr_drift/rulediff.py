@@ -52,7 +52,9 @@ def load_at(root: str, ref: str, adr_dir=None):
 def _rules(loaded) -> dict:
     out: dict = {}
     for r in loaded.rules:
-        out.setdefault(r.describe(), r.where())
+        text = r.describe() + (f" [scope: {', '.join(r.scope)}]"
+                               if r.scope else "")
+        out.setdefault(text, r.where())
     return out
 
 

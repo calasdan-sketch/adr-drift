@@ -27,7 +27,8 @@ import re
 
 #: The rule names the DSL knows.
 KINDS = ("forbid-import", "forbid-pattern", "require-pattern",
-         "forbid-cycles", "layer-order", "only-import", "public-api")
+         "forbid-cycles", "layer-order", "only-import", "public-api",
+         "forbid-transitive")
 
 
 @dataclasses.dataclass
@@ -46,10 +47,20 @@ class Rule:
     # layer-order: the layers, highest first. only-import / public-api: the
     # allowed targets.
     names: list = dataclasses.field(default_factory=list)
+    # Globs (repo-relative, '/') of the files this rule is about; [] means
+    # every file. Set from an ADR's `Scope:`, never from the rule text, so
+    # the rule's own description (which waivers quote) does not change.
+    scope: list = dataclasses.field(default_factory=list)
+
+    def in_scope(self, rel: str) -> bool:
+        return not self.scope or any(match_glob(g, rel) for g in self.scope)
 
     def describe(self) -> str:
         if self.kind == "forbid-import":
             return f"{self.from_pat} must not import {self.to_pat}"
+        if self.kind == "forbid-transitive":
+            return (f"{self.from_pat} must not reach {self.to_pat} "
+                    "through imports")
         if self.kind == "forbid-pattern":
             return f"{self.glob} must not contain /{self.regex}/"
         if self.kind == "forbid-cycles":
@@ -72,8 +83,8 @@ class Rule:
 # The text is stripped before it is matched, so no \s*$ is needed after the
 # rest (a lazy group followed by \s*$ is quadratic on a long run of blanks).
 _RULE_RE = re.compile(
-    r"^(forbid-import|forbid-pattern|require-pattern|forbid-cycles|"
-    r"layer-order|only-import|public-api)\s*:\s*(.+)$")
+    r"^(forbid-import|forbid-transitive|forbid-pattern|require-pattern|"
+    r"forbid-cycles|layer-order|only-import|public-api)\s*:\s*(.+)$")
 
 
 def parse_rule_line(line: str, source: str = "",
@@ -87,22 +98,22 @@ def parse_rule_line(line: str, source: str = "",
         return None
     kind, rest = m.group(1), m.group(2)
     rule = Rule(kind=kind, source=source, line_no=line_no, raw=line.strip())
-    if kind == "forbid-import":
+    if kind in ("forbid-import", "forbid-transitive"):
         parts = rest.split("->")
         if len(parts) != 2:
-            raise ValueError(f"bad forbid-import rule: {line.strip()!r} "
+            raise ValueError(f"bad {kind} rule: {line.strip()!r} "
                              f"(want '<from> -> <to>')")
         rule.from_pat = parts[0].strip()
         rule.to_pat = parts[1].strip()
         if not rule.from_pat or not rule.to_pat:
-            raise ValueError(f"bad forbid-import rule: {line.strip()!r}")
+            raise ValueError(f"bad {kind} rule: {line.strip()!r}")
         for side in (rule.from_pat, rule.to_pat):
             if re.search(r"\s", side):
                 # "handlers -> db because layering" would otherwise become a
                 # rule whose target is the phrase "db because layering" and
                 # never match anything.
                 raise ValueError(
-                    f"bad forbid-import rule: {line.strip()!r} ({side!r} "
+                    f"bad {kind} rule: {line.strip()!r} ({side!r} "
                     "contains spaces; each side is one layer name or module "
                     "prefix - put explanations after a '#')")
     elif kind == "layer-order":
@@ -170,11 +181,12 @@ _EMPHASIS_RE = re.compile(r"^(\*\*|__)(.*?)\1")
 _HEAD_WORD_RE = re.compile(r"^([A-Za-z][A-Za-z_ -]{2,40}?)\s*:")
 _KEYWORD_INSIDE_RE = re.compile(
     r"(?<![\w-])(?:(?:forbid|require)[-_ ]?(?:import|pattern|cycle)s?"
+    r"|forbid[-_ ]?transitive"
     r"|layer[-_ ]order|only[-_ ]import|public[-_ ]api)\s*:", re.I)
 _BARE_ARROW_RE = re.compile(r"^[\w.*/-]+\s*->\s*[\w.*/-]+$")
 _NAME_NO_COLON_RE = re.compile(
-    r"^(?:forbid-import|forbid-pattern|require-pattern|forbid-cycles|"
-    r"layer-order|only-import|public-api)\s")
+    r"^(?:forbid-import|forbid-transitive|forbid-pattern|require-pattern|"
+    r"forbid-cycles|layer-order|only-import|public-api)\s")
 
 
 def clean_rule_text(line: str) -> "tuple[str, bool]":
